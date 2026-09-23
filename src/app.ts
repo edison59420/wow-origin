@@ -20,13 +20,21 @@ const platformFactory = require('../platforms/PlatformFactory');
 const NeteasePlatform = require('../platforms/netease/NeteasePlatform');
 const QQMusicPlatform = require('../platforms/qqmusic/QQMusicPlatform');
 
-const INTERNAL_RESOURCE_ROUTES = new Set(['login/refresh', 'login/phone/send', 'login/phone/check', 'login/cookie']);
+const INTERNAL_RESOURCE_ROUTES = new Set([
+  'login/refresh',
+  'login/phone/send',
+  'login/phone/check',
+  'login/cookie'
+]);
 
 class MultiPlatformServer {
   private app: Express | null = null;
   private initialized = false;
   private logger: any;
-  private accountSessions: AccountSessionRegistry = { sessions: [], byAccessKey: new Map() };
+  private accountSessions: AccountSessionRegistry = {
+    sessions: [],
+    byAccessKey: new Map()
+  };
   private readonly lxSourceManager: AppLxSourceManager;
   private readonly accountStore: AccountStore;
   private readonly cloudflare: boolean;
@@ -35,11 +43,20 @@ class MultiPlatformServer {
 
   constructor(options: CreateAppOptions = {}) {
     this.logger = new Logger({ component: 'server' });
-    this.accountStore = options.accountStore ?? loadLocalAccountStore();
-    this.lxSourceManager = options.lxSourceManager ?? loadLocalLxSourceManager();
+
+    this.accountStore =
+      options.accountStore ?? loadLocalAccountStore();
+
+    this.lxSourceManager =
+      options.lxSourceManager ?? loadLocalLxSourceManager();
+
     this.cloudflare = options.cloudflare === true;
-    this.serveStatic = options.serveStatic ?? !this.cloudflare;
-    this.preload = options.preload ?? !this.cloudflare;
+
+    this.serveStatic =
+      options.serveStatic ?? !this.cloudflare;
+
+    this.preload =
+      options.preload ?? !this.cloudflare;
   }
 
   private shouldExposeOpenApiDocs(): boolean {
@@ -54,37 +71,78 @@ class MultiPlatformServer {
     await this.registerPlatforms();
 
     this.app = express();
+
     this.setupMiddleware();
+
     await this.setupRoutes();
 
     this.initialized = true;
+
     this.app.platformFactory = platformFactory;
+
     this.app.lxSourceManager = this.lxSourceManager;
-    this.app.lxSourceUpdateScheduler = createLxSourceUpdateScheduler(this.lxSourceManager);
-    this.app.loginRefreshScheduler = createLoginRefreshScheduler({
-      registry: this.accountSessions,
-      platformFactory,
-      accountStore: this.accountStore
-    });
-    this.logger.compact('info', 'Multi-platform music server initialized', 'debug');
+
+    this.app.lxSourceUpdateScheduler =
+      createLxSourceUpdateScheduler(
+        this.lxSourceManager
+      );
+
+    this.app.loginRefreshScheduler =
+      createLoginRefreshScheduler({
+        registry: this.accountSessions,
+        platformFactory,
+        accountStore: this.accountStore
+      });
+
+    this.logger.compact(
+      'info',
+      'Multi-platform music server initialized',
+      'debug'
+    );
+
     return this.app;
   }
 
   async registerPlatforms(): Promise<boolean> {
     try {
-      this.logger.compact('platform', 'Registering platform adapters...', 'debug');
+      this.logger.compact(
+        'platform',
+        'Registering platform adapters...',
+        'debug'
+      );
 
-      platformFactory.register('netease', NeteasePlatform, { name: 'netease' });
-      platformFactory.register('qqmusic', QQMusicPlatform, { name: 'qqmusic' });
+      platformFactory.register(
+        'netease',
+        NeteasePlatform,
+        { name: 'netease' }
+      );
+
+      platformFactory.register(
+        'qqmusic',
+        QQMusicPlatform,
+        { name: 'qqmusic' }
+      );
 
       await platformFactory.initialize();
 
-      const platformCount: number = platformFactory.getAvailablePlatforms().length;
-      this.logger.compact('platform', `Platform registration completed (${platformCount} platforms loaded)`, 'debug');
+      const platformCount: number =
+        platformFactory
+          .getAvailablePlatforms()
+          .length;
+
+      this.logger.compact(
+        'platform',
+        `Platform registration completed (${platformCount} platforms loaded)`,
+        'debug'
+      );
 
       return true;
     } catch (error) {
-      this.logger.error('Platform registration failed', error);
+      this.logger.error(
+        'Platform registration failed',
+        error
+      );
+
       throw error;
     }
   }
@@ -92,130 +150,333 @@ class MultiPlatformServer {
   setupMiddleware(): void {
     const { CORS_ALLOW_ORIGIN } = process.env;
 
-    this.app!.set('trust proxy', true);
+    this.app!.set(
+      'trust proxy',
+      true
+    );
+
     this.app!.use(cookieParser());
-    if (this.serveStatic) this.app!.use(express.static(path.join(__dirname, '..', 'public')));
-    this.accountSessions = loadAccountSessions(this.accountStore);
+
+    if (this.serveStatic) {
+      this.app!.use(
+        express.static(
+          path.join(__dirname, '..', 'public')
+        )
+      );
+    }
+
+    this.accountSessions =
+      loadAccountSessions(
+        this.accountStore
+      );
+
     this.reconcileLxSources();
 
-    this.app!.use((req: Request, res: Response, next: NextFunction) => {
-      const isDocsPath = req.path.startsWith('/docs');
-      if (req.path !== '/' && !req.path.includes('.') && !(this.shouldExposeOpenApiDocs() && isDocsPath)) {
-        res.set({
-          'Access-Control-Allow-Credentials': 'true',
-          'Access-Control-Allow-Origin': CORS_ALLOW_ORIGIN || (req.headers.origin as string) || '*',
-          'Access-Control-Allow-Headers': 'X-Requested-With,Content-Type,Authorization',
-          'Access-Control-Allow-Methods': 'POST,PUT,GET,OPTIONS',
-          'Content-Type': 'application/json; charset=utf-8',
-        });
-      }
-      req.method === 'OPTIONS' ? res.status(204).end() : next();
-    });
+    this.app!.use(
+      (
+        req: Request,
+        res: Response,
+        next: NextFunction
+      ) => {
+        const isDocsPath =
+          req.path.startsWith('/docs');
 
-    this.app!.use(express.json({ limit: '5mb' }));
-    this.app!.use(express.urlencoded({ extended: false, limit: '5mb' }));
+        if (
+          req.path !== '/' &&
+          !req.path.includes('.') &&
+          !(
+            this.shouldExposeOpenApiDocs() &&
+            isDocsPath
+          )
+        ) {
+          res.set({
+            'Access-Control-Allow-Credentials':
+              'true',
+
+            'Access-Control-Allow-Origin':
+              CORS_ALLOW_ORIGIN ||
+              (req.headers.origin as string) ||
+              '*',
+
+            'Access-Control-Allow-Headers':
+              'X-Requested-With,Content-Type,Authorization',
+
+            'Access-Control-Allow-Methods':
+              'POST,PUT,GET,OPTIONS',
+
+            'Content-Type':
+              'application/json; charset=utf-8'
+          });
+        }
+
+        req.method === 'OPTIONS'
+          ? res.status(204).end()
+          : next();
+      }
+    );
+
+    this.app!.use(
+      express.json({
+        limit: '5mb'
+      })
+    );
+
+    this.app!.use(
+      express.urlencoded({
+        extended: false,
+        limit: '5mb'
+      })
+    );
   }
 
   async setupRoutes(): Promise<void> {
     if (this.shouldExposeOpenApiDocs()) {
-      this.app!.get('/openapi.json', (_req: Request, res: Response) => {
-        res.json(openApiDocument);
-      });
+      this.app!.get(
+        '/openapi.json',
+        (_req: Request, res: Response) => {
+          res.json(openApiDocument);
+        }
+      );
     }
 
-    this.app!.use('/app/api', createDashboardRouter({
-      registry: this.accountSessions,
-      cloudflare: this.cloudflare
-    }));
-    this.app!.use('/login', createLoginRouter({
-      registry: this.accountSessions,
-      platformFactory,
-      accountStore: this.accountStore,
-      allowAccountLxSources: !this.cloudflare,
-      onAccountsChanged: () => this.reconcileLxSources()
-    }));
-    this.app!.use(createWowRouter({
-      resolveContext: createWowContextResolver(this.accountSessions, this.lxSourceManager),
-      onError: (error, request) => this.logger.error('Wow v1 request failed', error, { url: request.url })
-    }));
-    if (this.preload) await preloadData(platformFactory, this.accountSessions, this.lxSourceManager);
+    this.app!.use(
+      '/app/api',
+      createDashboardRouter({
+        registry: this.accountSessions,
+        cloudflare: this.cloudflare
+      })
+    );
 
-    const resourceRoutes: string[] = platformFactory
-      .getAvailableRoutes()
-      .filter((route: string) => !INTERNAL_RESOURCE_ROUTES.has(route));
+    this.app!.use(
+      '/login',
+      createLoginRouter({
+        registry: this.accountSessions,
+        platformFactory,
+        accountStore: this.accountStore,
+        allowAccountLxSources:
+          !this.cloudflare,
+        onAccountsChanged: () =>
+          this.reconcileLxSources()
+      })
+    );
 
-    resourceRoutes.forEach((route: string) => {
-      this.app!.all(`/${route}`, async (req: Request, res: Response) => {
-        await this.handleResourceAPI(req, res, route);
-      });
-    });
+    this.app!.use(
+      createWowRouter({
+        resolveContext:
+          createWowContextResolver(
+            this.accountSessions,
+            this.lxSourceManager
+          ),
 
-    this.app!.use((_req: Request, res: Response) => {
-      res.status(404).json(Result.error('API endpoint not found', 404));
-    });
+        onError: (
+          error,
+          request
+        ) =>
+          this.logger.error(
+            'Wow v1 request failed',
+            error,
+            {
+              url: request.url
+            }
+          )
+      })
+    );
 
-    this.app!.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
-      this.logger.error('Unhandled error', error, { url: _req.url });
-      if (error instanceof APIError) {
-        res.status(error.status).json(Result.error(error.message, error.status));
-        return;
+    if (this.preload) {
+      await preloadData(
+        platformFactory,
+        this.accountSessions,
+        this.lxSourceManager
+      );
+    }
+
+    const resourceRoutes: string[] =
+      platformFactory
+        .getAvailableRoutes()
+        .filter(
+          (route: string) =>
+            !INTERNAL_RESOURCE_ROUTES.has(route)
+        );
+
+    resourceRoutes.forEach(
+      (route: string) => {
+        this.app!.all(
+          `/${route}`,
+          async (
+            req: Request,
+            res: Response
+          ) => {
+            await this.handleResourceAPI(
+              req,
+              res,
+              route
+            );
+          }
+        );
       }
-      res.status(500).json(Result.error('Internal server error', 500));
-    });
+    );
+
+    this.app!.use(
+      (
+        _req: Request,
+        res: Response
+      ) => {
+        res
+          .status(404)
+          .json(
+            Result.error(
+              'API endpoint not found',
+              404
+            )
+          );
+      }
+    );
+
+    this.app!.use(
+      (
+        error: Error,
+        _req: Request,
+        res: Response,
+        _next: NextFunction
+      ) => {
+        this.logger.error(
+          'Unhandled error',
+          error,
+          {
+            url: _req.url
+          }
+        );
+
+        if (error instanceof APIError) {
+          res
+            .status(error.status)
+            .json(
+              Result.error(
+                error.message,
+                error.status
+              )
+            );
+
+          return;
+        }
+
+        res
+          .status(500)
+          .json(
+            Result.error(
+              'Internal server error',
+              500
+            )
+          );
+      }
+    );
   }
 
   private reconcileLxSources(): void {
     this.lxSourceManager.reconcileAccountSources(
-      this.accountSessions.sessions.map((session) => session.lxSource)
+      this.accountSessions.sessions.map(
+        (session) => session.lxSource
+      )
     );
   }
 
-  async handleResourceAPI(req: Request, res: Response, route: string): Promise<void> {
+  async handleResourceAPI(
+    req: Request,
+    res: Response,
+    route: string
+  ): Promise<void> {
     const startTime = Date.now();
 
     try {
       if (req.cookies) {
-        if (req.cookies.MUSIC_U && !req.query.MUSIC_U) {
-          req.query.MUSIC_U = req.cookies.MUSIC_U;
+        if (
+          req.cookies.MUSIC_U &&
+          !req.query.MUSIC_U
+        ) {
+          req.query.MUSIC_U =
+            req.cookies.MUSIC_U;
         }
-        if (req.cookies.uin && !req.query.uin) {
-          req.query.uin = req.cookies.uin;
+
+        if (
+          req.cookies.uin &&
+          !req.query.uin
+        ) {
+          req.query.uin =
+            req.cookies.uin;
         }
-        if (req.cookies.qm_keyst && !req.query.qm_keyst) {
-          req.query.qm_keyst = req.cookies.qm_keyst;
+
+        if (
+          req.cookies.qm_keyst &&
+          !req.query.qm_keyst
+        ) {
+          req.query.qm_keyst =
+            req.cookies.qm_keyst;
         }
       }
 
-      const platformName = (req.query.platform as string) || req.body?.platform || 'netease';
+      const platformName =
+        (req.query.platform as string) ||
+        req.body?.platform ||
+        'netease';
 
-      const platform = platformFactory.getPlatform(platformName);
-      const result = await platform.callModule(route, req);
+      const platform =
+        platformFactory.getPlatform(
+          platformName
+        );
 
-      res.status(result.code).json(result);
+      const result =
+        await platform.callModule(
+          route,
+          req
+        );
+
+      res
+        .status(result.code)
+        .json(result);
 
     } catch (error) {
-      const responseTime = Date.now() - startTime;
+      const responseTime =
+        Date.now() - startTime;
 
-      this.logger.error('API request failed', error, {
-        route,
-        platform: (req.query.platform as string) || req.body?.platform || 'unknown',
-        responseTime
-      });
+      this.logger.error(
+        'API request failed',
+        error,
+        {
+          route,
+          platform:
+            (req.query.platform as string) ||
+            req.body?.platform ||
+            'unknown',
+          responseTime
+        }
+      );
 
-      const errorResult = Result.error(error, 500);
-      res.status(errorResult.code).json(errorResult);
+      const errorResult =
+        Result.error(
+          error,
+          500
+        );
+
+      res
+        .status(errorResult.code)
+        .json(errorResult);
     }
   }
 
   stop(): void {
-    if (this.app && this.app.server) {
+    if (
+      this.app &&
+      this.app.server
+    ) {
       this.app.server.close();
-      this.logger.info('Server stopped');
+
+      this.logger.info(
+        'Server stopped'
+      );
     }
   }
 }
 
-/** 创建并初始化 Express 应用；监听端口由 server.ts 负责。 */
 export interface CreateAppOptions {
   accountStore?: AccountStore;
   lxSourceManager?: AppLxSourceManager;
@@ -224,22 +485,53 @@ export interface CreateAppOptions {
   preload?: boolean;
 }
 
-export interface AppLxSourceManager extends LxTrackUrlResolver, LxSourceLifecycle {
-  reconcileAccountSources(sourceGroups: readonly (readonly string[])[]): void;
+export interface AppLxSourceManager
+  extends LxTrackUrlResolver,
+    LxSourceLifecycle {
+  reconcileAccountSources(
+    sourceGroups: readonly (
+      readonly string[]
+    )[]
+  ): void;
 }
 
 function loadLocalAccountStore(): AccountStore {
   const localRequire = require;
-  return localRequire('./storage').createLocalAccountStore();
+
+  return localRequire(
+    './storage'
+  ).createLocalAccountStore();
 }
 
 function loadLocalLxSourceManager(): AppLxSourceManager {
   const localRequire = require;
-  return localRequire('./lx-resource').createLxSourceManager();
+
+  return localRequire(
+    './lx-resource'
+  ).createLxSourceManager();
 }
 
-export async function createApp(options: CreateAppOptions = {}): Promise<Express> {
-  return new MultiPlatformServer(options).initialize();
+export async function createApp(
+  options: CreateAppOptions = {}
+): Promise<Express> {
+  let accountStore =
+    options.accountStore;
+
+  if (!accountStore) {
+    const githubStoreModule =
+      await import('./githubAccountStore');
+
+    accountStore =
+      await githubStoreModule.createGitHubAccountStore();
+  }
+
+  return new MultiPlatformServer({
+    ...options,
+    accountStore
+  }).initialize();
 }
 
-export { MultiPlatformServer, platformFactory };
+export {
+  MultiPlatformServer,
+  platformFactory
+};
