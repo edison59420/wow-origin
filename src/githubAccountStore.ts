@@ -1,27 +1,29 @@
-import { createLocalAccountStore, type AccountStore } from './storage/accounts';
 import type { RawMusicAccount } from './accounts';
+import {
+  createLocalAccountStore,
+  type AccountStore
+} from './storage/accounts';
 
-const DEFAULT_DATA_FILE = 'accounts.json';
+const GITHUB_API = 'https://api.github.com';
+const DATA_FILE = 'accounts.json';
 
-interface GitHubFileResponse {
+type GitHubFileResponse = {
   content?: string;
   sha?: string;
-  encoding?: string;
-}
+};
 
 function getConfig(): { token: string; repo: string } | null {
   const token = String(process.env.GITHUB_TOKEN || '').trim();
   const repo = String(process.env.GITHUB_DATA_REPO || '').trim();
 
   if (!token || !repo) {
+    console.warn(
+      '[github-sync] 未設定 GITHUB_TOKEN 或 GITHUB_DATA_REPO，GitHub 備份停用'
+    );
     return null;
   }
 
   return { token, repo };
-}
-
-function githubUrl(repo: string): string {
-  return `https://api.github.com/repos/${repo}/contents/${DEFAULT_DATA_FILE}`;
 }
 
 function githubHeaders(token: string): Record<string, string> {
@@ -29,32 +31,31 @@ function githubHeaders(token: string): Record<string, string> {
     Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': 'wow-origin-render'
+    'Content-Type': 'application/json'
   };
 }
 
-function decodeGitHubContent(content: string): RawMusicAccount[] {
-  const normalized = content.replace(/\n/g, '');
-  const json = Buffer.from(normalized, 'base64').toString('utf8');
-  const parsed: unknown = JSON.parse(json);
+async function githubGetAccounts(): Promise<{
+  exists: boolean;
+  accounts: RawMusicAccount[];
+  sha?: string;
+}> {
+  const config = getConfig();
 
-  if (!Array.isArray(parsed)) {
-    throw new Error('GitHub accounts.json 必须是数组');
+  if (!config) {
+    return {
+      exists: false,
+      accounts: []
+    };
   }
 
-  return parsed.filter(
-    (item): item is RawMusicAccount =>
-      Boolean(item && typeof item === 'object' && !Array.isArray(item))
+  const response = await fetch(
+    `${GITHUB_API}/repos/${config.repo}/contents/${DATA_FILE}`,
+    {
+      method: 'GET',
+      headers: githubHeaders(config.token)
+    }
   );
-}
-
-async function readGitHubAccounts(
-  config: { token: string; repo: string }
-): Promise<{ exists: boolean; accounts: RawMusicAccount[]; sha?: string }> {
-  const response = await fetch(githubUrl(config.repo), {
-    method: 'GET',
-    headers: githubHeaders(config.token)
-  });
 
   if (response.status === 404) {
     return {
@@ -64,141 +65,195 @@ async function readGitHubAccounts(
   }
 
   if (!response.ok) {
-    const message = await response.text();
-    throw new Error(`读取 GitHub accounts.json 失败: HTTP ${response.status} ${message}`);
+    throw new Error(
+      `GitHub 讀取 accounts.json 失敗: ${response.status} ${await response.text()}`
+    );
   }
 
-  const data = (await response.json()) as GitHubFileResponse;
+  const data = await response.json() as GitHubFileResponse;
 
   if (!data.content) {
-    throw new Error('GitHub accounts.json 没有内容');
+    return {
+      exists: true,
+      accounts: [],
+      sha: data.sha
+    };
+  }
+
+  const content = Buffer.from(
+    data.content.replace(/\n/g, ''),
+    'base64'
+  ).toString('utf8');
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw new Error('GitHub accounts.json 不是有效 JSON');
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error('GitHub accounts.json 必須是陣列');
   }
 
   return {
     exists: true,
-    accounts: decodeGitHubContent(data.content),
+    accounts: parsed as RawMusicAccount[],
     sha: data.sha
   };
 }
 
-async function writeGitHubAccounts(
-  config: { token: string; repo: string },
+async function githubWriteAccounts(
   accounts: RawMusicAccount[]
-): Promise<void> {
-  const first = await readGitHubAccounts(config);
-
-  const content = Buffer.from(
-    JSON.stringify(accounts, null, 2) + '\n',
-    'utf8'
-  ).toString('base64');
-
-  const body: Record<string, unknown> = {
-    message: 'chore: update music accounts',
-    content
-  };
-
-  if (first.sha) {
-    body.sha = first.sha;
-  }
-
-  const response = await fetch(githubUrl(config.repo), {
-    method: 'PUT',
-    headers: {
-      ...githubHeaders(config.token),
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(body)
-  });
-
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(`写入 GitHub accounts.json 失败: HTTP ${response.status} ${message}`);
-  }
-}
-
-export async function restoreAccountsFromGitHub(
-  store: AccountStore
 ): Promise<void> {
   const config = getConfig();
 
   if (!config) {
-    console.log('[github-account] 未配置 GITHUB_TOKEN/GITHUB_DATA_REPO，跳过 GitHub 恢复');
     return;
   }
 
-  try {
-    const remote = await readGitHubAccounts(config);
-    const localAccounts = store.list();
+  const existing = await githubGetAccounts();
 
-    if (!remote.exists) {
-      console.log('[github-account] GitHub 尚无 accounts.json，正在创建初始备份');
-      if (localAccounts.length > 0) {
-        await writeGitHubAccounts(config, localAccounts);
-      } else {
-        await writeGitHubAccounts(config, []);
-      }
-      return;
+  const content = JSON.stringify(accounts, null, 2) + '\n';
+
+  const body: Record<string, unknown> = {
+    message: 'auto: save music accounts',
+    content: Buffer.from(content, 'utf8').toString('base64')
+  };
+
+  if (existing.sha) {
+    body.sha = existing.sha;
+  }
+
+  const response = await fetch(
+    `${GITHUB_API}/repos/${config.repo}/contents/${DATA_FILE}`,
+    {
+      method: 'PUT',
+      headers: githubHeaders(config.token),
+      body: JSON.stringify(body)
     }
+  );
 
-    if (remote.accounts.length > 0) {
-      store.replaceAll(remote.accounts);
-      console.log(
-        `[github-account] 已从 GitHub 恢复 ${remote.accounts.length} 个账号`
-      );
-      return;
-    }
+  if (!response.ok) {
+    throw new Error(
+      `GitHub 寫入 accounts.json 失敗: ${response.status} ${await response.text()}`
+    );
+  }
 
-    if (localAccounts.length > 0) {
-      await writeGitHubAccounts(config, localAccounts);
-      console.log(
-        `[github-account] GitHub 账号为空，已保留本地 ${localAccounts.length} 个账号并上传`
-      );
-      return;
-    }
+  console.log(
+    `[github-sync] 已保存 ${accounts.length} 個帳號到 GitHub`
+  );
+}
 
-    console.log('[github-account] GitHub 与本地都没有账号');
-  } catch (error) {
-    console.error('[github-account] 恢复失败，继续使用本地账号数据', error);
+export class GitHubAccountStore implements AccountStore {
+  readonly location: string;
+
+  private readonly localStore: AccountStore;
+  private syncQueue: Promise<void> = Promise.resolve();
+
+  constructor(
+    localStore: AccountStore = createLocalAccountStore()
+  ) {
+    this.localStore = localStore;
+    this.location = localStore.location;
+  }
+
+  list(): RawMusicAccount[] {
+    return this.localStore.list();
+  }
+
+  insert(account: RawMusicAccount): void {
+    this.localStore.insert(account);
+    this.scheduleSync();
+  }
+
+  update(
+    apiAccessKey: string,
+    changes: Partial<RawMusicAccount>
+  ): void {
+    this.localStore.update(apiAccessKey, changes);
+    this.scheduleSync();
+  }
+
+  private scheduleSync(): void {
+    this.syncQueue = this.syncQueue
+      .then(async () => {
+        try {
+          await githubWriteAccounts(this.localStore.list());
+        } catch (error) {
+          console.error(
+            '[github-sync] 自動保存失敗:',
+            error
+          );
+        }
+      })
+      .catch((error) => {
+        console.error(
+          '[github-sync] 同步佇列錯誤:',
+          error
+        );
+      });
   }
 }
 
-export function createGitHubAccountStore(
-  workDir: string = process.cwd()
-): AccountStore {
-  const localStore = createLocalAccountStore(workDir);
+export async function createGitHubAccountStore(): Promise<GitHubAccountStore> {
+  const localStore = createLocalAccountStore();
+  const store = new GitHubAccountStore(localStore);
   const config = getConfig();
 
-  return {
-    get location() {
-      return localStore.location;
-    },
+  if (!config) {
+    return store;
+  }
 
-    list() {
-      return localStore.list();
-    },
+  try {
+    const remote = await githubGetAccounts();
+    const localAccounts = localStore.list();
 
-    insert(account: RawMusicAccount) {
-      localStore.insert(account);
-
-      if (config) {
-        void writeGitHubAccounts(config, localStore.list()).catch((error) => {
-          console.error('[github-account] 新增账号同步失败', error);
-        });
+    /*
+     * GitHub 有帳號，而且 Render 本地 SQLite 是空的：
+     * 從 GitHub 恢復。
+     */
+    if (
+      remote.exists &&
+      remote.accounts.length > 0 &&
+      localAccounts.length === 0
+    ) {
+      for (const account of remote.accounts) {
+        if (account && typeof account === 'object') {
+          localStore.insert(account);
+        }
       }
-    },
 
-    update(apiAccessKey: string, changes: Partial<RawMusicAccount>) {
-      localStore.update(apiAccessKey, changes);
+      console.log(
+        `[github-sync] 已從 GitHub 恢復 ${remote.accounts.length} 個帳號`
+      );
 
-      if (config) {
-        void writeGitHubAccounts(config, localStore.list()).catch((error) => {
-          console.error('[github-account] 更新账号同步失败', error);
-        });
-      }
-    },
-
-    replaceAll(accounts: RawMusicAccount[]) {
-      localStore.replaceAll(accounts);
+      return store;
     }
-  } as AccountStore;
+
+    /*
+     * GitHub 還沒有帳號，但 Render 本地已經有帳號：
+     * 第一次啟用 GitHub 備份時，把現有帳號保存上去。
+     */
+    if (
+      (!remote.exists || remote.accounts.length === 0) &&
+      localAccounts.length > 0
+    ) {
+      await githubWriteAccounts(localAccounts);
+
+      console.log(
+        `[github-sync] 已將本地 ${localAccounts.length} 個帳號首次備份到 GitHub`
+      );
+    }
+
+    return store;
+  } catch (error) {
+    console.error(
+      '[github-sync] 啟動恢復失敗，繼續使用本地 SQLite:',
+      error
+    );
+
+    return store;
+  }
 }
