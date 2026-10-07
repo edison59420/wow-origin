@@ -1,46 +1,27 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { RawMusicAccount } from '../accounts';
 export interface AccountStore {
   readonly location: string;
   list(): RawMusicAccount[];
   insert(account: RawMusicAccount): void;
   delete(apiAccessKey: string): void;
-  update(apiAccessKey: string, changes: Partial<RawMusicAccount>): void;
+  update(
+    apiAccessKey: string,
+    changes: Partial<RawMusicAccount>
+  ): void;
 }
-type StoredAccountRow = {
-  id: number;
-  platform: string | null;
-  name: string | null;
-  cookie: string | null;
-  api_access_key: string | null;
-  stateless: string | null;
-  use_luoxue: string | null;
-  lx_source: string | null;
-  device_id: string | null;
-  device_state: string | null;
+type EncryptedPayload = {
+  version: number;
+  algorithm: 'aes-256-gcm';
+  kdf: 'pbkdf2-sha256';
+  iterations: number;
+  salt: string;
+  iv: string;
+  tag: string;
+  data: string;
 };
-const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform TEXT,
-    name TEXT,
-    cookie TEXT,
-    api_access_key TEXT,
-    stateless TEXT,
-    use_luoxue TEXT,
-    lx_source TEXT,
-    deviceId TEXT,
-    device_state TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE INDEX IF NOT EXISTS accounts_access_key_idx
-    ON accounts(api_access_key);
-  PRAGMA user_version = 2;
-`;
 const ENCRYPTED_FILE = path.join(
   process.cwd(),
   'data',
@@ -52,16 +33,26 @@ const GITHUB_REPO =
 const GITHUB_PATH =
   process.env.ACCOUNT_SYNC_PATH ||
   'accounts/accounts.enc';
-const GITHUB_LEGACY_PATH = 'data.db.b64';
 const ENCRYPTION_VERSION = 2;
 const PBKDF2_ITERATIONS = 210000;
 const AES_KEY_LENGTH = 32;
 const IV_LENGTH = 12;
 const SALT_LENGTH = 16;
 let syncQueue: Promise<void> = Promise.resolve();
+/**
+ * 將資料轉成 JSON 字串。
+ */
 function encode(value: unknown): string | null {
-  return value === undefined ? null : JSON.stringify(value);
+  return value === undefined
+    ? null
+    : JSON.stringify(value);
 }
+/**
+ * 從 SQLite 舊格式相容的 JSON 字串還原。
+ *
+ * 現在新的 accounts.enc 不再使用 SQLite，
+ * 但這個函式保留作為一般資料解碼工具。
+ */
 function decode(value: string | null): unknown {
   if (value === null) return undefined;
   try {
@@ -70,56 +61,12 @@ function decode(value: string | null): unknown {
     return undefined;
   }
 }
-function accountValues(
-  account: RawMusicAccount
-): Array<string | null> {
-  return [
-    encode(account.platform),
-    encode(account.name),
-    encode(account.cookie),
-    typeof account.api_access_key === 'string'
-      ? account.api_access_key
-      : account.api_access_key === undefined
-        ? null
-        : String(account.api_access_key),
-    encode(account.stateless),
-    encode(account.useLuoxue),
-    encode(account.lxSource),
-    encode(account.deviceId),
-    encode(account.deviceState)
-  ];
-}
-function rowToAccount(
-  row: StoredAccountRow
-): RawMusicAccount {
-  return {
-    platform: decode(row.platform),
-    name: decode(row.name),
-    cookie: decode(row.cookie),
-    api_access_key:
-      row.api_access_key ?? undefined,
-    stateless: decode(row.stateless),
-    useLuoxue: decode(row.use_luoxue),
-    lxSource: decode(row.lx_source),
-    deviceId: decode(row.device_id),
-    deviceState: decode(row.device_state)
-  };
-}
 /**
- * 保留原本專案對 data/data.db 的相容路徑。
- */
-export function sqliteAccountsFilePath(
-  workDir: string = process.cwd()
-): string {
-  return path.join(workDir, 'data', 'data.db');
-}
-/**
- * AES-256-GCM 的加密金鑰由 Render 的
- * ACCOUNT_SYNC_KEY 派生。
+ * 從 Render 環境變數 ACCOUNT_SYNC_KEY
+ * 派生 AES-256-GCM 金鑰。
  *
- * 注意：
- * ACCOUNT_SYNC_KEY 絕對不能更換，
- * 否則以前的 accounts.enc 無法解密。
+ * 重要：
+ * ACCOUNT_SYNC_KEY 一旦開始使用後不要更換。
  */
 function getEncryptionKey(salt: Buffer): Buffer {
   const secret = process.env.ACCOUNT_SYNC_KEY;
@@ -136,16 +83,9 @@ function getEncryptionKey(salt: Buffer): Buffer {
     'sha256'
   );
 }
-type EncryptedPayload = {
-  version: number;
-  algorithm: 'aes-256-gcm';
-  kdf: 'pbkdf2-sha256';
-  iterations: number;
-  salt: string;
-  iv: string;
-  tag: string;
-  data: string;
-};
+/**
+ * 將帳號資料加密成 accounts.enc。
+ */
 function encryptAccounts(
   accounts: RawMusicAccount[]
 ): string {
@@ -175,8 +115,15 @@ function encryptAccounts(
     tag: tag.toString('base64'),
     data: encrypted.toString('base64')
   };
-  return JSON.stringify(payload, null, 2);
+  return JSON.stringify(
+    payload,
+    null,
+    2
+  );
 }
+/**
+ * 解密 accounts.enc。
+ */
 function decryptAccounts(
   content: string
 ): RawMusicAccount[] {
@@ -197,6 +144,16 @@ function decryptAccounts(
       'accounts.enc 使用了不受支持的加密格式'
     );
   }
+  if (
+    !payload.salt ||
+    !payload.iv ||
+    !payload.tag ||
+    !payload.data
+  ) {
+    throw new Error(
+      'accounts.enc 缺少必要的加密字段'
+    );
+  }
   const salt = Buffer.from(
     payload.salt,
     'base64'
@@ -213,6 +170,21 @@ function decryptAccounts(
     payload.data,
     'base64'
   );
+  if (salt.length !== SALT_LENGTH) {
+    throw new Error(
+      'accounts.enc 的 salt 长度无效'
+    );
+  }
+  if (iv.length !== IV_LENGTH) {
+    throw new Error(
+      'accounts.enc 的 iv 长度无效'
+    );
+  }
+  if (tag.length !== 16) {
+    throw new Error(
+      'accounts.enc 的认证标签长度无效'
+    );
+  }
   const key = getEncryptionKey(salt);
   try {
     const decipher = crypto.createDecipheriv(
@@ -225,7 +197,9 @@ function decryptAccounts(
       decipher.update(encrypted),
       decipher.final()
     ]).toString('utf8');
-    const parsed = JSON.parse(plaintext);
+    const parsed = JSON.parse(
+      plaintext
+    );
     if (
       !parsed ||
       !Array.isArray(parsed.accounts)
@@ -242,13 +216,18 @@ function decryptAccounts(
     );
   }
 }
+/**
+ * 安全写入文件。
+ */
 function atomicWrite(
   filename: string,
   content: string
 ): void {
   fs.mkdirSync(
     path.dirname(filename),
-    { recursive: true }
+    {
+      recursive: true
+    }
   );
   const temporary =
     `${filename}.${process.pid}.${Date.now()}.tmp`;
@@ -265,34 +244,47 @@ function atomicWrite(
     filename
   );
   try {
-    fs.chmodSync(filename, 0o600);
+    fs.chmodSync(
+      filename,
+      0o600
+    );
   } catch {
-    // 某些平台可能不支持 chmod，忽略即可。
+    // 某些平台可能不支持 chmod。
   }
 }
+/**
+ * GitHub API。
+ */
 async function githubRequest(
   url: string,
   init: RequestInit = {}
 ): Promise<Response> {
-  const token = process.env.GITHUB_TOKEN;
+  const token =
+    process.env.GITHUB_TOKEN;
   if (!token) {
     throw new Error(
       '缺少 GITHUB_TOKEN，无法同步账号资料'
     );
   }
-  return fetch(url, {
-    ...init,
-    headers: {
-      Accept:
-        'application/vnd.github+json',
-      Authorization:
-        `Bearer ${token}`,
-      'X-GitHub-Api-Version':
-        '2022-11-28',
-      ...(init.headers || {})
+  return fetch(
+    url,
+    {
+      ...init,
+      headers: {
+        Accept:
+          'application/vnd.github+json',
+        Authorization:
+          `Bearer ${token}`,
+        'X-GitHub-Api-Version':
+          '2022-11-28',
+        ...(init.headers || {})
+      }
     }
-  });
+  );
 }
+/**
+ * GitHub Contents API URL。
+ */
 function githubContentsUrl(
   repo: string,
   filePath: string
@@ -302,33 +294,39 @@ function githubContentsUrl(
     filePath
   );
 }
+/**
+ * 從 GitHub 下載 accounts.enc。
+ */
 async function downloadGithubFile(
   filePath: string
 ): Promise<{
   content: Buffer;
   sha?: string;
 } | null> {
-  const response = await githubRequest(
-    githubContentsUrl(
-      GITHUB_REPO,
-      filePath
-    )
-  );
+  const response =
+    await githubRequest(
+      githubContentsUrl(
+        GITHUB_REPO,
+        filePath
+      )
+    );
   if (response.status === 404) {
     return null;
   }
   if (!response.ok) {
-    const text = await response.text();
+    const text =
+      await response.text();
     throw new Error(
       `GitHub 读取 ${filePath} 失败: ` +
       `${response.status} ${text}`
     );
   }
-  const json = await response.json() as {
-    content?: string;
-    encoding?: string;
-    sha?: string;
-  };
+  const json =
+    await response.json() as {
+      content?: string;
+      encoding?: string;
+      sha?: string;
+    };
   if (
     !json.content ||
     json.encoding !== 'base64'
@@ -345,41 +343,49 @@ async function downloadGithubFile(
     sha: json.sha
   };
 }
+/**
+ * 上傳 accounts.enc 到 GitHub。
+ */
 async function uploadGithubFile(
   filePath: string,
   content: Buffer,
   message: string
 ): Promise<void> {
   const existing =
-    await downloadGithubFile(filePath);
+    await downloadGithubFile(
+      filePath
+    );
   const body: {
     message: string;
     content: string;
-    branch?: string;
     sha?: string;
   } = {
     message,
-    content: content.toString('base64')
+    content:
+      content.toString('base64')
   };
   if (existing?.sha) {
     body.sha = existing.sha;
   }
-  const response = await githubRequest(
-    githubContentsUrl(
-      GITHUB_REPO,
-      filePath
-    ),
-    {
-      method: 'PUT',
-      headers: {
-        'Content-Type':
-          'application/json'
-      },
-      body: JSON.stringify(body)
-    }
-  );
+  const response =
+    await githubRequest(
+      githubContentsUrl(
+        GITHUB_REPO,
+        filePath
+      ),
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type':
+            'application/json'
+        },
+        body:
+          JSON.stringify(body)
+      }
+    );
   if (!response.ok) {
-    const text = await response.text();
+    const text =
+      await response.text();
     throw new Error(
       `GitHub 写入 ${filePath} 失败: ` +
       `${response.status} ${text}`
@@ -387,13 +393,12 @@ async function uploadGithubFile(
   }
 }
 /**
- * 将当前账号资料写入：
+ * 將目前帳號資料：
  *
- * data/accounts.enc
+ * 1. 加密到 Render 本機 data/accounts.enc
+ * 2. 上傳到 GitHub：
  *
- * 然后同步：
- *
- * wow-origin-data/accounts/accounts.enc
+ *    wow-origin-data/accounts/accounts.enc
  */
 async function syncAccountsToGitHub(
   accounts: RawMusicAccount[]
@@ -416,168 +421,85 @@ async function syncAccountsToGitHub(
     `[account-sync] 已加密同步 ${accounts.length} 个账号到 GitHub`
   );
 }
+/**
+ * 將同步工作排隊。
+ *
+ * 避免連續登入／更新帳號時同時寫 GitHub，
+ * 導致 GitHub SHA 衝突。
+ */
 function queueSync(
   accounts: RawMusicAccount[]
 ): void {
   const snapshot =
-    accounts.map(account => ({
-      ...account
-    }));
-  syncQueue = syncQueue
-    .then(() =>
-      syncAccountsToGitHub(snapshot)
-    )
-    .catch(error => {
-      console.error(
-        '[account-sync] GitHub 同步失败:',
-        error
+    accounts.map(
+      account => ({
+        ...account
+      })
+    );
+  syncQueue =
+    syncQueue
+      .then(
+        () =>
+          syncAccountsToGitHub(
+            snapshot
+          )
+      )
+      .catch(
+        error => {
+          console.error(
+            '[account-sync] GitHub 同步失败:',
+            error
+          );
+        }
       );
-    });
 }
 /**
- * 启动时恢复账号。
+ * 啟動時從 GitHub 恢復帳號。
  *
- * 优先：
+ * 只讀：
+ *
  *   accounts/accounts.enc
  *
- * 如果新加密文件不存在，则自动寻找旧的：
- *   data.db.b64
+ * 不再讀：
  *
- * 旧 data.db.b64 会被读取、转换成账号数组，
- * 再加密为 accounts.enc。
+ *   data.db.b64
  */
 export async function restoreAccountsFromGitHub():
   Promise<void> {
   fs.mkdirSync(
-    path.dirname(ENCRYPTED_FILE),
-    { recursive: true }
+    path.dirname(
+      ENCRYPTED_FILE
+    ),
+    {
+      recursive: true
+    }
   );
   try {
-    const encrypted =
+    const remote =
       await downloadGithubFile(
         GITHUB_PATH
       );
-    if (encrypted) {
-      const encryptedText =
-        encrypted.content.toString('utf8');
-      const accounts =
-        decryptAccounts(encryptedText);
-      atomicWrite(
-        ENCRYPTED_FILE,
+    if (!remote) {
+      console.log(
+        '[account-sync] GitHub 尚无 accounts.enc，将使用新的账号存储'
+      );
+      return;
+    }
+    const encryptedText =
+      remote.content.toString(
+        'utf8'
+      );
+    const accounts =
+      decryptAccounts(
         encryptedText
       );
-      console.log(
-        `[account-sync] 已从 GitHub 恢复 ${accounts.length} 个加密账号`
-      );
-      return;
-    }
-    console.log(
-      '[account-sync] GitHub 尚无 accounts.enc，尝试恢复旧 data.db.b64'
+    atomicWrite(
+      ENCRYPTED_FILE,
+      encryptedText
     );
-    const legacy =
-      await downloadGithubFile(
-        GITHUB_LEGACY_PATH
-      );
-    if (!legacy) {
-      console.log(
-        '[account-sync] GitHub 也没有旧 data.db.b64'
-      );
-      return;
-    }
-    const workDir =
-      fs.mkdtempSync(
-        path.join(
-          process.cwd(),
-          'account-migration-'
-        )
-      );
-    const legacyDb =
-      path.join(
-        workDir,
-        'data.db'
-      );
-    try {
-      fs.writeFileSync(
-        legacyDb,
-        legacy.content,
-        {
-          mode: 0o600
-        }
-      );
-      const database =
-        new DatabaseSync(legacyDb);
-      try {
-        const columns =
-          database
-            .prepare(
-              'PRAGMA table_info(accounts)'
-            )
-            .all() as Array<{
-              name: string;
-            }>;
-        if (
-          !columns.some(
-            column =>
-              column.name ===
-              'api_access_key'
-          )
-        ) {
-          throw new Error(
-            '旧 data.db.b64 中没有 accounts 表的 api_access_key 字段'
-          );
-        }
-        const rows =
-          database
-            .prepare(`
-              SELECT
-                id,
-                platform,
-                name,
-                cookie,
-                api_access_key,
-                stateless,
-                use_luoxue,
-                lx_source,
-                deviceId AS device_id,
-                device_state
-              FROM accounts
-              ORDER BY id ASC
-            `)
-            .all() as unknown as StoredAccountRow[];
-        const accounts =
-          rows.map(rowToAccount);
-        console.log(
-          `[account-sync] 从旧 data.db.b64 读取到 ${accounts.length} 个账号`
-        );
-        const encrypted =
-          encryptAccounts(accounts);
-        atomicWrite(
-          ENCRYPTED_FILE,
-          encrypted
-        );
-        await uploadGithubFile(
-          GITHUB_PATH,
-          Buffer.from(
-            encrypted,
-            'utf8'
-          ),
-          'chore: migrate legacy account database to encrypted storage'
-        );
-        console.log(
-          `[account-sync] 已将 ${accounts.length} 个旧账号转换为加密存储`
-        );
-      } finally {
-        database.close();
-      }
-    } finally {
-      fs.rmSync(
-        workDir,
-        {
-          recursive: true,
-          force: true
-        }
-      );
-    }
+    console.log(
+      `[account-sync] 已从 GitHub 恢复 ${accounts.length} 个加密账号`
+    );
   } catch (error) {
     console.error(
       '[account-sync] 恢复账号失败:',
@@ -586,39 +508,46 @@ export async function restoreAccountsFromGitHub():
     throw error;
   }
 }
+/**
+ * 新的獨立加密帳號儲存。
+ */
 export class EncryptedAccountStore
   implements AccountStore {
   readonly location =
     ENCRYPTED_FILE;
-  private accounts: RawMusicAccount[];
+  private accounts:
+    RawMusicAccount[];
   constructor(
     workDir: string = process.cwd()
   ) {
     this.accounts = [];
-    fs.mkdirSync(
+    const file =
       path.join(
         workDir,
-        'data'
-      ),
+        'data',
+        'accounts.enc'
+      );
+    fs.mkdirSync(
+      path.dirname(file),
       {
         recursive: true
       }
     );
     if (
-      fs.existsSync(
-        this.location
-      )
+      fs.existsSync(file)
     ) {
       const content =
         fs.readFileSync(
-          this.location,
+          file,
           'utf8'
         );
       this.accounts =
-        decryptAccounts(content);
+        decryptAccounts(
+          content
+        );
     }
     console.log(
-      `[accounts] 独立加密存储已启用: ${this.location}`
+      `[accounts] 独立加密存储已启用: ${file}`
     );
   }
   list(): RawMusicAccount[] {
@@ -631,6 +560,28 @@ export class EncryptedAccountStore
   insert(
     account: RawMusicAccount
   ): void {
+    const apiAccessKey =
+      String(
+        account.api_access_key || ''
+      ).trim();
+    if (!apiAccessKey) {
+      throw new Error(
+        '账号缺少 api_access_key'
+      );
+    }
+    if (
+      this.accounts.some(
+        item =>
+          String(
+            item.api_access_key || ''
+          ).trim() ===
+          apiAccessKey
+      )
+    ) {
+      throw new Error(
+        'api_access_key 已存在'
+      );
+    }
     this.accounts.push({
       ...account
     });
@@ -643,7 +594,9 @@ export class EncryptedAccountStore
     const index =
       this.accounts.findIndex(
         account =>
-          account.api_access_key ===
+          String(
+            account.api_access_key || ''
+          ).trim() ===
           apiAccessKey
       );
     if (index < 0) {
@@ -665,7 +618,9 @@ export class EncryptedAccountStore
     this.accounts =
       this.accounts.filter(
         account =>
-          account.api_access_key !==
+          String(
+            account.api_access_key || ''
+          ).trim() !==
           apiAccessKey
       );
     this.persist();
@@ -685,7 +640,9 @@ export class EncryptedAccountStore
   }
 }
 /**
- * 兼容项目现有 createLocalAccountStore()
+ * 相容現有 accounts.ts：
+ *
+ * createLocalAccountStore()
  */
 export function createLocalAccountStore(
   workDir: string = process.cwd()
@@ -695,10 +652,10 @@ export function createLocalAccountStore(
   );
 }
 /**
- * 保留旧类名称，避免其他代码如果仍然引用
- * SqliteAccountStore 时发生编译问题。
+ * 保留舊名稱，避免其他程式碼仍引用
+ * SqliteAccountStore 時編譯失敗。
  *
- * 实际新的本地账号存储已经改为加密文件。
+ * 實際上已經不再使用 SQLite。
  */
 export class SqliteAccountStore
   extends EncryptedAccountStore {
