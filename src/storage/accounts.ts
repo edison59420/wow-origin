@@ -1,213 +1,511 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+  scryptSync
+} from 'node:crypto';
 import type { RawMusicAccount } from '../accounts';
-
 export interface AccountStore {
   readonly location: string;
   list(): RawMusicAccount[];
   insert(account: RawMusicAccount): void;
-  delete(apiAccessKey: string): void;
   update(apiAccessKey: string, changes: Partial<RawMusicAccount>): void;
+  delete(apiAccessKey: string): void;
 }
-
-type StoredAccountRow = {
-  id: number;
-  platform: string | null;
-  name: string | null;
-  cookie: string | null;
-  api_access_key: string | null;
-  stateless: string | null;
-  use_luoxue: string | null;
-  lx_source: string | null;
-  device_id: string | null;
-  device_state: string | null;
-};
-
-const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform TEXT,
-    name TEXT,
-    cookie TEXT,
-    api_access_key TEXT,
-    stateless TEXT,
-    use_luoxue TEXT,
-    lx_source TEXT,
-    deviceId TEXT,
-    device_state TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE INDEX IF NOT EXISTS accounts_access_key_idx ON accounts(api_access_key);
-  PRAGMA user_version = 2;
-`;
-
-function encode(value: unknown): string | null {
-  return value === undefined ? null : JSON.stringify(value);
+const DATA_DIR_NAME = 'data';
+const LOCAL_FILE_NAME = 'accounts.enc';
+const GITHUB_FILE_PATH =
+  process.env.ACCOUNT_SYNC_PATH?.trim() ||
+  'accounts/accounts.enc';
+const GITHUB_API = 'https://api.github.com';
+interface EncryptedPayload {
+  version: 1;
+  algorithm: 'aes-256-gcm';
+  iv: string;
+  tag: string;
+  data: string;
 }
-
-function decode(value: string | null): unknown {
-  if (value === null) return undefined;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return undefined;
+function dataFilePath(workDir: string = process.cwd()): string {
+  return path.join(workDir, DATA_DIR_NAME, LOCAL_FILE_NAME);
+}
+function getGitHubConfig(): {
+  token: string;
+  repo: string;
+  path: string;
+} | null {
+  const token = String(process.env.GITHUB_TOKEN || '').trim();
+  const repo = String(process.env.GITHUB_DATA_REPO || '').trim();
+  if (!token || !repo) {
+    return null;
   }
-}
-
-function accountValues(account: RawMusicAccount): Array<string | null> {
-  return [
-    encode(account.platform),
-    encode(account.name),
-    encode(account.cookie),
-    typeof account.api_access_key === 'string'
-      ? account.api_access_key
-      : account.api_access_key === undefined
-        ? null
-        : String(account.api_access_key),
-    encode(account.stateless),
-    encode(account.useLuoxue),
-    encode(account.lxSource),
-    encode(account.deviceId),
-    encode(account.deviceState)
-  ];
-}
-
-function rowToAccount(row: StoredAccountRow): RawMusicAccount {
+  if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) {
+    console.warn(
+      '[account-sync] GITHUB_DATA_REPO 格式错误，应为 owner/repository'
+    );
+    return null;
+  }
   return {
-    platform: decode(row.platform),
-    name: decode(row.name),
-    cookie: decode(row.cookie),
-    api_access_key: row.api_access_key ?? undefined,
-    stateless: decode(row.stateless),
-    useLuoxue: decode(row.use_luoxue),
-    lxSource: decode(row.lx_source),
-    deviceId: decode(row.device_id),
-    deviceState: decode(row.device_state)
+    token,
+    repo,
+    path: GITHUB_FILE_PATH
   };
 }
-
-export function sqliteAccountsFilePath(workDir: string = process.cwd()): string {
-  return path.join(workDir, 'data', 'data.db');
-}
-
-function migrateLegacySqliteFile(workDir: string, destination: string): void {
-  if (fs.existsSync(destination)) return;
-  const legacy = path.join(workDir, 'data', 'wow-origin.sqlite');
-  if (!fs.existsSync(legacy)) return;
-
-  for (const suffix of ['-wal', '-shm']) {
-    const source = `${legacy}${suffix}`;
-    if (fs.existsSync(source)) fs.renameSync(source, `${destination}${suffix}`);
+function getEncryptionKey(): Buffer {
+  const secret = String(process.env.ACCOUNT_SYNC_KEY || '').trim();
+  if (!secret) {
+    throw new Error(
+      'ACCOUNT_SYNC_KEY 未配置；账号加密存储已启用，请在 Render Environment 添加 ACCOUNT_SYNC_KEY'
+    );
   }
-  fs.renameSync(legacy, destination);
+  /*
+   * 使用 scrypt 将用户提供的密钥稳定派生为 32 字节 AES-256 密钥。
+   * 固定 salt 仅用于密钥派生；真正的数据安全由随机 IV + AES-GCM 提供。
+   */
+  return scryptSync(
+    secret,
+    'wow-origin-account-store-v1',
+    32
+  );
 }
-
-export class SqliteAccountStore implements AccountStore {
+function encryptAccounts(accounts: RawMusicAccount[]): string {
+  const key = getEncryptionKey();
+  const iv = randomBytes(12);
+  const cipher = createCipheriv(
+    'aes-256-gcm',
+    key,
+    iv
+  );
+  const plaintext = Buffer.from(
+    JSON.stringify({
+      version: 1,
+      accounts
+    }),
+    'utf8'
+  );
+  const encrypted = Buffer.concat([
+    cipher.update(plaintext),
+    cipher.final()
+  ]);
+  const tag = cipher.getAuthTag();
+  const payload: EncryptedPayload = {
+    version: 1,
+    algorithm: 'aes-256-gcm',
+    iv: iv.toString('base64url'),
+    tag: tag.toString('base64url'),
+    data: encrypted.toString('base64url')
+  };
+  return JSON.stringify(payload);
+}
+function decryptAccounts(content: string): RawMusicAccount[] {
+  const key = getEncryptionKey();
+  let payload: EncryptedPayload;
+  try {
+    payload = JSON.parse(content);
+  } catch {
+    throw new Error('账号加密文件不是有效 JSON');
+  }
+  if (
+    payload?.version !== 1 ||
+    payload?.algorithm !== 'aes-256-gcm' ||
+    typeof payload.iv !== 'string' ||
+    typeof payload.tag !== 'string' ||
+    typeof payload.data !== 'string'
+  ) {
+    throw new Error('账号加密文件格式无效');
+  }
+  const decipher = createDecipheriv(
+    'aes-256-gcm',
+    key,
+    Buffer.from(payload.iv, 'base64url')
+  );
+  decipher.setAuthTag(
+    Buffer.from(payload.tag, 'base64url')
+  );
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(payload.data, 'base64url')),
+    decipher.final()
+  ]);
+  const parsed = JSON.parse(
+    decrypted.toString('utf8')
+  );
+  if (
+    !parsed ||
+    parsed.version !== 1 ||
+    !Array.isArray(parsed.accounts)
+  ) {
+    throw new Error('解密后的账号数据格式无效');
+  }
+  return parsed.accounts as RawMusicAccount[];
+}
+function atomicWrite(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), {
+    recursive: true
+  });
+  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(
+    temporary,
+    content,
+    {
+      encoding: 'utf8',
+      mode: 0o600
+    }
+  );
+  fs.renameSync(
+    temporary,
+    filePath
+  );
+}
+async function githubRequest(
+  url: string,
+  init: RequestInit
+): Promise<Response> {
+  const config = getGitHubConfig();
+  if (!config) {
+    throw new Error(
+      'GITHUB_TOKEN 或 GITHUB_DATA_REPO 未配置'
+    );
+  }
+  const headers = new Headers(init.headers);
+  headers.set(
+    'Authorization',
+    `Bearer ${config.token}`
+  );
+  headers.set(
+    'Accept',
+    'application/vnd.github+json'
+  );
+  headers.set(
+    'X-GitHub-Api-Version',
+    '2022-11-28'
+  );
+  headers.set(
+    'User-Agent',
+    'wow-origin-account-sync'
+  );
+  return fetch(url, {
+    ...init,
+    headers
+  });
+}
+function githubFileApiUrl(): string {
+  const config = getGitHubConfig();
+  if (!config) {
+    throw new Error(
+      'GitHub 同步未配置'
+    );
+  }
+  return `${GITHUB_API}/repos/${config.repo}/contents/${config.path
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/')}`;
+}
+async function downloadGitHubEncryptedAccounts(): Promise<string | null> {
+  const config = getGitHubConfig();
+  if (!config) {
+    console.warn(
+      '[account-sync] GitHub 未配置，跳过远程恢复'
+    );
+    return null;
+  }
+  const response = await githubRequest(
+    githubFileApiUrl(),
+    {
+      method: 'GET'
+    }
+  );
+  if (response.status === 404) {
+    console.log(
+      '[account-sync] GitHub 尚无账号加密文件，将使用新的账号存储'
+    );
+    return null;
+  }
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(
+      `GitHub 读取账号文件失败 (${response.status}): ${message.slice(0, 300)}`
+    );
+  }
+  const body = await response.json() as {
+    content?: string;
+  };
+  if (!body.content) {
+    throw new Error(
+      'GitHub 账号文件没有 content'
+    );
+  }
+  return Buffer.from(
+    body.content.replace(/\s/g, ''),
+    'base64'
+  ).toString('utf8');
+}
+async function uploadGitHubEncryptedAccounts(
+  encryptedContent: string,
+  message: string
+): Promise<void> {
+  const config = getGitHubConfig();
+  if (!config) {
+    return;
+  }
+  let sha: string | undefined;
+  const existing = await githubRequest(
+    githubFileApiUrl(),
+    {
+      method: 'GET'
+    }
+  );
+  if (existing.ok) {
+    const body = await existing.json() as {
+      sha?: string;
+    };
+    sha = body.sha;
+  } else if (existing.status !== 404) {
+    const errorText = await existing.text();
+    throw new Error(
+      `GitHub 查询账号文件失败 (${existing.status}): ${errorText.slice(0, 300)}`
+    );
+  }
+  const encoded = Buffer.from(
+    encryptedContent,
+    'utf8'
+  ).toString('base64');
+  const response = await githubRequest(
+    githubFileApiUrl(),
+    {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message,
+        content: encoded,
+        ...(sha ? { sha } : {})
+      })
+    }
+  );
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `GitHub 保存账号文件失败 (${response.status}): ${errorText.slice(0, 500)}`
+    );
+  }
+}
+let restorePromise: Promise<void> | null = null;
+/**
+ * 启动前恢复账号：
+ *
+ * GitHub encrypted file
+ *        ↓
+ * 解密
+ *        ↓
+ * data/accounts.enc
+ */
+export async function restoreAccountsFromGitHub(
+  workDir: string = process.cwd()
+): Promise<void> {
+  if (restorePromise) {
+    return restorePromise;
+  }
+  restorePromise = (async () => {
+    const config = getGitHubConfig();
+    if (!config) {
+      console.warn(
+        '[account-sync] 未配置 GITHUB_TOKEN / GITHUB_DATA_REPO，使用本地账号文件'
+      );
+      return;
+    }
+    try {
+      const remote = await downloadGitHubEncryptedAccounts();
+      if (!remote) {
+        return;
+      }
+      /*
+       * 先验证密文能否使用当前 ACCOUNT_SYNC_KEY 解密。
+       * 如果密钥错误，绝不覆盖本地数据。
+       */
+      const accounts = decryptAccounts(remote);
+      const localPath = dataFilePath(workDir);
+      atomicWrite(
+        localPath,
+        remote
+      );
+      console.log(
+        `[account-sync] 已从 GitHub 恢复 ${accounts.length} 个账号`
+      );
+    } catch (error) {
+      console.error(
+        '[account-sync] GitHub 恢复账号失败，保留当前本地账号文件:',
+        error
+      );
+    }
+  })();
+  return restorePromise;
+}
+export class EncryptedAccountStore implements AccountStore {
   readonly location: string;
-  private readonly database: DatabaseSync;
-  private readonly insertStatement: StatementSync;
-
-  constructor(workDir: string = process.cwd()) {
-    this.location = sqliteAccountsFilePath(workDir);
-    fs.mkdirSync(path.dirname(this.location), { recursive: true });
-    migrateLegacySqliteFile(workDir, this.location);
-    this.database = new DatabaseSync(this.location);
-    this.database.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
-    this.database.exec(SCHEMA);
-    const columns = this.database.prepare('PRAGMA table_info(accounts)').all() as Array<{ name: string }>;
-    if (!columns.some(column => column.name === 'deviceId')) this.database.exec('ALTER TABLE accounts ADD COLUMN deviceId TEXT');
-    if (!columns.some(column => column.name === 'device_state')) this.database.exec('ALTER TABLE accounts ADD COLUMN device_state TEXT');
-    this.insertStatement = this.database.prepare(`
-      INSERT INTO accounts (
-        platform, name, cookie, api_access_key, stateless, use_luoxue, lx_source, deviceId, device_state
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    this.database.exec('CREATE TABLE IF NOT EXISTS account_migrations (name TEXT PRIMARY KEY)');
-    if (!this.database.prepare('SELECT name FROM account_migrations WHERE name = ?').get('legacy-json')) {
-      this.migrateLegacyAccounts(workDir);
-      this.database.prepare('INSERT INTO account_migrations (name) VALUES (?)').run('legacy-json');
-    }
-    fs.rmSync(path.join(workDir, 'data', 'accounts.json'), { force: true });
-  }
-
-  list(): RawMusicAccount[] {
-    const rows = this.database.prepare(`
-      SELECT id, platform, name, cookie, api_access_key, stateless, use_luoxue, lx_source, deviceId AS device_id, device_state
-      FROM accounts
-      ORDER BY id ASC
-    `).all() as unknown as StoredAccountRow[];
-    return rows.map(rowToAccount);
-  }
-
-  insert(account: RawMusicAccount): void {
-    this.insertStatement.run(...accountValues(account));
-  }
-
-  update(apiAccessKey: string, changes: Partial<RawMusicAccount>): void {
-    const row = this.database.prepare(`
-      SELECT id, platform, name, cookie, api_access_key, stateless, use_luoxue, lx_source, deviceId AS device_id, device_state
-      FROM accounts
-      WHERE api_access_key = ?
-      ORDER BY id ASC
-      LIMIT 1
-    `).get(apiAccessKey) as unknown as StoredAccountRow | undefined;
-    if (!row) throw new Error('SQLite 中未找到对应 api_access_key');
-
-    const account = { ...rowToAccount(row), ...changes, api_access_key: apiAccessKey };
-    this.database.prepare(`
-      UPDATE accounts
-      SET platform = ?, name = ?, cookie = ?, api_access_key = ?, stateless = ?,
-          use_luoxue = ?, lx_source = ?, deviceId = ?, device_state = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(...accountValues(account), row.id);
-  }
-
-  delete(apiAccessKey: string): void {
-    this.database.prepare('DELETE FROM accounts WHERE api_access_key = ?').run(apiAccessKey);
-  }
-
-  close(): void {
-    this.database.close();
-  }
-
-  private migrateLegacyAccounts(workDir: string): void {
-    const count = Number((this.database.prepare('SELECT COUNT(*) AS count FROM accounts').get() as { count: number }).count);
-    if (count > 0) return;
-
-    const legacyPath = path.join(workDir, 'data', 'accounts.json');
-    if (!fs.existsSync(legacyPath)) return;
-    const content = fs.readFileSync(legacyPath, 'utf8');
-    if (!content.trim()) return;
-
-    let accounts: unknown;
-    try {
-      accounts = JSON.parse(content);
-    } catch (error) {
-      console.error(`[accounts] JSON 迁移失败: ${legacyPath}`, error);
-      throw new Error(`旧账号文件迁移失败: ${legacyPath}`, { cause: error });
-    }
-    if (!Array.isArray(accounts)) {
-      throw new Error(`accounts.json 必须是数组: ${legacyPath}`);
-    }
-
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      accounts.forEach((account) => {
-        if (account && typeof account === 'object') {
-          this.insert(account as RawMusicAccount);
+  private accounts: RawMusicAccount[] = [];
+  private syncQueue: Promise<void> = Promise.resolve();
+  constructor(
+    workDir: string = process.cwd()
+  ) {
+    this.location = dataFilePath(workDir);
+    fs.mkdirSync(
+      path.dirname(this.location),
+      {
+        recursive: true
+      }
+    );
+    if (fs.existsSync(this.location)) {
+      try {
+        const content = fs.readFileSync(
+          this.location,
+          'utf8'
+        );
+        if (content.trim()) {
+          this.accounts = decryptAccounts(content);
         }
-      });
-      this.database.exec('COMMIT');
-      console.log(`[accounts] 已将 ${accounts.length} 条旧账号配置迁移到 SQLite`);
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
+      } catch (error) {
+        console.error(
+          '[accounts] 读取加密账号文件失败:',
+          error
+        );
+        /*
+         * 不删除损坏文件。
+         * 防止误操作导致账号永久丢失。
+         */
+        this.accounts = [];
+      }
     }
+    console.log(
+      `[accounts] 独立加密存储已启用: ${this.location}`
+    );
+  }
+  list(): RawMusicAccount[] {
+    return this.accounts.map(account => ({
+      ...account,
+      lxSource: Array.isArray(account.lxSource)
+        ? [...account.lxSource]
+        : []
+    }));
+  }
+  insert(account: RawMusicAccount): void {
+    const key = String(
+      account.api_access_key || ''
+    ).trim();
+    if (!key) {
+      throw new Error(
+        'api_access_key 不能为空'
+      );
+    }
+    if (
+      this.accounts.some(
+        item =>
+          String(item.api_access_key || '').trim() === key
+      )
+    ) {
+      throw new Error(
+        'api_access_key 已存在'
+      );
+    }
+    this.accounts.push({
+      ...account
+    });
+    this.persist(
+      '新增账号'
+    );
+  }
+  update(
+    apiAccessKey: string,
+    changes: Partial<RawMusicAccount>
+  ): void {
+    const key = String(
+      apiAccessKey || ''
+    ).trim();
+    const index = this.accounts.findIndex(
+      account =>
+        String(account.api_access_key || '').trim() === key
+    );
+    if (index < 0) {
+      throw new Error(
+        '加密账号存储中未找到对应 api_access_key'
+      );
+    }
+    this.accounts[index] = {
+      ...this.accounts[index],
+      ...changes,
+      api_access_key: key
+    };
+    this.persist(
+      '更新账号'
+    );
+  }
+  delete(apiAccessKey: string): void {
+    const key = String(
+      apiAccessKey || ''
+    ).trim();
+    const before = this.accounts.length;
+    this.accounts = this.accounts.filter(
+      account =>
+        String(account.api_access_key || '').trim() !== key
+    );
+    if (this.accounts.length === before) {
+      throw new Error(
+        '加密账号存储中未找到对应 api_access_key'
+      );
+    }
+    this.persist(
+      '删除账号'
+    );
+  }
+  private persist(
+    reason: string
+  ): void {
+    const encrypted = encryptAccounts(
+      this.accounts
+    );
+    atomicWrite(
+      this.location,
+      encrypted
+    );
+    /*
+     * 所有写入排队。
+     * 避免 QQ 自动刷新 Cookie 与用户修改设置同时上传时
+     * 后一次 PUT 覆盖前一次 PUT。
+     */
+    this.syncQueue = this.syncQueue
+      .then(async () => {
+        try {
+          await uploadGitHubEncryptedAccounts(
+            encrypted,
+            `accounts: ${reason}`
+          );
+          console.log(
+            `[account-sync] GitHub 同步成功: ${reason}`
+          );
+        } catch (error) {
+          console.error(
+            `[account-sync] GitHub 同步失败: ${reason}`,
+            error
+          );
+        }
+      })
+      .catch(() => {
+        // 永远不让同步错误阻断账号操作。
+      });
   }
 }
-
-export function createLocalAccountStore(workDir: string = process.cwd()): SqliteAccountStore {
-  return new SqliteAccountStore(workDir);
+export function createLocalAccountStore(
+  workDir: string = process.cwd()
+): AccountStore {
+  return new EncryptedAccountStore(workDir);
+}
+/**
+ * 保留旧函数名称，避免其他代码调用时报错。
+ */
+export function sqliteAccountsFilePath(
+  workDir: string = process.cwd()
+): string {
+  return dataFilePath(workDir);
 }
