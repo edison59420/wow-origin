@@ -8,6 +8,7 @@ import { preloadData } from './onload';
 import { APIError } from './errors';
 import { AccountSessionRegistry, extractAuthorizationToken, loadAccountSessions } from './accounts';
 import type { AccountStore } from './storage';
+import { backupAccounts, restoreAccountBackup } from './storage/accountSync';
 import { createLoginRouter } from './login';
 import { createDashboardRouter } from './dashboard';
 import { createLoginRefreshScheduler, ensureQQLoginFresh, clearAccountLoginRefresh } from './loginRefresh';
@@ -38,6 +39,8 @@ class MultiPlatformServer {
   private readonly serveStatic: boolean;
   private readonly preload: boolean;
   private readonly adminManagementPassword: string;
+  private accountSyncTimer?: NodeJS.Timeout;
+  private accountSyncBusy = false;
 
   constructor(options: CreateAppOptions = {}) {
     this.adminManagementPassword = options.adminManagementPassword ?? process.env.ADMIN_MANAGEMENT_PASSWORD ?? '';
@@ -58,11 +61,14 @@ class MultiPlatformServer {
       return this.app!;
     }
 
+    // Restore encrypted account backup before sessions are loaded from SQLite.
+    await restoreAccountBackup(this.accountStore);
     await this.registerPlatforms();
 
     this.app = express();
     this.setupMiddleware();
     await this.setupRoutes();
+    this.startAccountBackupSync();
 
     this.initialized = true;
     this.app.platformFactory = platformFactory;
@@ -141,14 +147,20 @@ class MultiPlatformServer {
       cloudflare: this.cloudflare,
       adminManagementPassword: this.adminManagementPassword,
       accountStore: this.accountStore,
-      onAccountsChanged: () => this.reconcileLxSources()
+      onAccountsChanged: () => {
+        this.reconcileLxSources();
+        void this.backupAccountsNow();
+      }
     }));
     this.app!.use('/login', createLoginRouter({
       registry: this.accountSessions,
       platformFactory,
       accountStore: this.accountStore,
       allowAccountLxSources: !this.cloudflare,
-      onAccountsChanged: () => this.reconcileLxSources()
+      onAccountsChanged: () => {
+        this.reconcileLxSources();
+        void this.backupAccountsNow();
+      }
     }));
     this.app!.use('/v1', async (req: Request, _res: Response, next: NextFunction) => {
       const key = extractAuthorizationToken(req.header('Authorization'));
@@ -285,6 +297,26 @@ class MultiPlatformServer {
     });
   }
 
+  private startAccountBackupSync(): void {
+    if (!process.env.GITHUB_TOKEN || !process.env.GITHUB_DATA_REPO || !process.env.ACCOUNT_SYNC_KEY) return;
+    const intervalMs = Math.max(5000, Number(process.env.ACCOUNT_SYNC_INTERVAL_MS || 15000));
+    void this.backupAccountsNow();
+    this.accountSyncTimer = setInterval(() => { void this.backupAccountsNow(); }, intervalMs);
+    this.accountSyncTimer.unref?.();
+  }
+
+  private async backupAccountsNow(): Promise<void> {
+    if (this.accountSyncBusy) return;
+    this.accountSyncBusy = true;
+    try {
+      await backupAccounts(this.accountStore);
+    } catch (error) {
+      this.logger.error('Encrypted GitHub account backup failed', error);
+    } finally {
+      this.accountSyncBusy = false;
+    }
+  }
+
   private reconcileLxSources(): void {
     this.lxSourceManager.reconcileAccountSources(
       this.accountSessions.sessions.map((session) => session.lxSource)
@@ -329,6 +361,7 @@ class MultiPlatformServer {
   }
 
   stop(): void {
+    if (this.accountSyncTimer) clearInterval(this.accountSyncTimer);
     if (this.app && this.app.server) {
       this.app.server.close();
       this.logger.info('Server stopped');
