@@ -16,6 +16,7 @@ import {
 } from './config';
 import { LxSourceRuntime } from './runtime';
 import { getExactLxQuality } from './quality';
+import { LX_QUALITIES } from './types';
 import type {
   LxLogLevel,
   LxSourceCapabilities,
@@ -142,36 +143,59 @@ export class LxSourceManager implements LxTrackUrlResolver, LxSourceLifecycle {
     createLxSourceConfigs(accountSources).forEach((config) => selectedConfigs.set(config.hash, config));
     this.globalConfigs.forEach((config) => selectedConfigs.set(config.hash, config));
 
-    for (const config of selectedConfigs.values()) {
+    const availableSources = [...selectedConfigs.values()]
+      .map((config) => ({ config, source: this.sources.get(config.hash) }))
+      .filter((item) => Boolean(item.source?.capabilities[lxPlatform]));
+
+    // Quality is the outer loop: first compete across every source at the same
+    // quality, then fall back only if all sources at that quality fail.
+    const supportedQualities = [...new Set(availableSources.flatMap(({ source }) =>
+      source!.capabilities[lxPlatform]!.qualities
+    ))];
+    const exactQuality = getExactLxQuality(platform, quality, supportedQualities);
+    const requestedCandidates = options.allowFallback === false
+      ? (exactQuality ? [exactQuality] : [])
+      : getLxQualityCandidates(quality, supportedQualities, platform);
+    const allowedQualities = platform === 'qq'
+      ? supportedQualities.filter((candidate) => ['128k', '320k', 'flac', 'flac24bit', 'master'].includes(candidate))
+      : supportedQualities;
+    const orderedCandidates = quality === 'max' && options.allowFallback !== false
+      ? [...LX_QUALITIES].reverse().filter((candidate) => allowedQualities.includes(candidate))
+      : requestedCandidates;
+
+    for (const lxQuality of orderedCandidates) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      const source = this.sources.get(config.hash);
-      const capability = source?.capabilities[lxPlatform];
-      if (!source || !capability) continue;
-      const exactQuality = getExactLxQuality(platform, quality, capability.qualities);
-      const candidates = options.allowFallback === false
-        ? (exactQuality ? [exactQuality] : [])
-        : getLxQualityCandidates(quality, capability.qualities, platform);
-      for (const lxQuality of candidates) {
-        const candidateRemaining = deadline - Date.now();
-        if (candidateRemaining <= 0) break;
-        try {
-          const result = await source.runtime.invoke({
-            source: lxPlatform,
-            quality: lxQuality,
-            timeoutMs: Math.min(SOURCE_REQUEST_TIMEOUT_MS, candidateRemaining),
-            musicInfo: {
-              id,
-              songmid: id,
-              ...(lxPlatform === 'tx' ? { strMediaMid: id } : {}),
+      const attempts = availableSources
+        .filter(({ source }) => source!.capabilities[lxPlatform]!.qualities.includes(lxQuality))
+        .map(async ({ config, source }) => {
+          const registered = source!;
+          const capability = registered.capabilities[lxPlatform]!;
+          try {
+            const result = await registered.runtime.invoke({
               source: lxPlatform,
-              types: capability.qualities.map((type) => ({ type, size: null }))
-            }
-          });
-          return mapLxQualityToTrackUrl(validateAudioUrl(result), lxQuality);
-        } catch (error) {
-          this.log('warn', source.name, config.hash, `获取音频失败: ${safeErrorMessage(error)}`);
-        }
+              quality: lxQuality,
+              timeoutMs: Math.min(SOURCE_REQUEST_TIMEOUT_MS, Math.max(1, deadline - Date.now())),
+              musicInfo: {
+                id,
+                songmid: id,
+                ...(lxPlatform === 'tx' ? { strMediaMid: id } : {}),
+                source: lxPlatform,
+                types: capability.qualities.map((type) => ({ type, size: null }))
+              }
+            });
+            return validateAudioUrl(result);
+          } catch (error) {
+            this.log('warn', registered.name, config.hash, `获取音频失败: ${safeErrorMessage(error)}`);
+            throw error;
+          }
+        });
+      if (!attempts.length) continue;
+      try {
+        const winner = await Promise.any(attempts);
+        return mapLxQualityToTrackUrl(winner, lxQuality);
+      } catch {
+        // All sources failed for this quality; try the next quality tier.
       }
     }
     return undefined;
