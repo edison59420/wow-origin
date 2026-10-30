@@ -31,13 +31,9 @@ export function getExactLxQuality(
 }
 
 /**
- * 音質候選排序：
- * 以 App 指定檔位為第一順位，只在該檔位失敗後向下 fallback。
- *
- * max 明確要求最高音質；
- * min 明確要求目前可用的最低音質。
- *
- * allowFallback=false 時只嘗試 App 指定的精確檔位。
+ * 音質候選排序：以 App 指定檔位為第一順位，只在該檔位失敗後向下 fallback。
+ * max 明確要求最高音質；min 以 320k 作為最低可接受檔位。
+ * allowFallback=false 時只嘗試 App 指定的精確檔位，不擅自升級或降級。
  */
 export function getLxQualityPriority(
   platform: MusicPlatform,
@@ -65,12 +61,11 @@ export function getLxQualityPriority(
   };
 
   const selected = requestedQuality?.trim().toLowerCase() || 'exhigh';
-
   if (selected === 'jyeffect') return [];
 
   if (selected === 'min') {
-    const minimum = [...order].reverse().find((item) => available.includes(item));
-    return minimum ? [minimum] : [];
+    // min 的最低回退底線為 320k，不選 128k。
+    return available.includes('320k') ? ['320k'] : [];
   }
 
   if (selected === 'max') {
@@ -80,13 +75,12 @@ export function getLxQualityPriority(
 
   const requested = requestedMap[selected] || '320k';
   const requestedIndex = order.indexOf(requested);
-
   if (requestedIndex < 0) return [];
 
   if (!allowFallback) {
     return available.includes(requested) ? [requested] : [];
   }
 
-  // 從 App 指定音質開始往低檔嘗試，不先查詢更高檔位。
+  // 關鍵：從 App 指定音質開始往低檔嘗試，絕不先查詢更高檔位。
   return order.slice(requestedIndex).filter((item) => available.includes(item));
 }
