@@ -59,6 +59,7 @@ async function start() {
           httpServer.close(() => resolve());
         });
       }
+      await app.accountBackup?.stop();
       await app.lxSourceManager?.stop();
       console.log(`${red}👋 Server closed${reset}`);
       process.exit(0);

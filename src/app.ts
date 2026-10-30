@@ -8,9 +8,9 @@ import { preloadData } from './onload';
 import { APIError } from './errors';
 import { AccountSessionRegistry, extractAuthorizationToken, loadAccountSessions } from './accounts';
 import type { AccountStore } from './storage';
+import type { GitHubAccountBackup } from './storage/github-backup';
 import { createLoginRouter } from './login';
 import { createDashboardRouter } from './dashboard';
-import type { LoginStateStores } from './loginState';
 import { createLoginRefreshScheduler, ensureQQLoginFresh, clearAccountLoginRefresh } from './loginRefresh';
 import { createLxSourceUpdateScheduler } from './lx-resource/scheduler';
 import { clearYTMusicVisitorCache } from './ytmusic/api';
@@ -35,30 +35,22 @@ class MultiPlatformServer {
   private accountSessions: AccountSessionRegistry = { sessions: [], byAccessKey: new Map() };
   private readonly lxSourceManager: AppLxSourceManager;
   private readonly accountStore: AccountStore;
+  private readonly accountBackup?: GitHubAccountBackup;
   private readonly cloudflare: boolean;
-  private readonly edgeone: boolean;
   private readonly serveStatic: boolean;
   private readonly preload: boolean;
   private readonly adminManagementPassword: string;
-  private readonly loginStateStores?: LoginStateStores;
-  private readonly loginPageHtml?: string;
-  private readonly onRoutes?: (app: Express) => void;
-  private accountRefreshAt = 0;
-  private accountForceRefreshAt = 0;
-  private accountRefresh?: Promise<void>;
 
   constructor(options: CreateAppOptions = {}) {
     this.adminManagementPassword = options.adminManagementPassword ?? process.env.ADMIN_MANAGEMENT_PASSWORD ?? '';
     this.logger = new Logger({ component: 'server' });
     this.accountStore = options.accountStore ?? loadLocalAccountStore();
-    this.lxSourceManager = options.lxSourceManager ?? loadLocalLxSourceManager();
     this.cloudflare = options.cloudflare === true;
-    this.edgeone = options.edgeone === true;
-    this.loginStateStores = options.loginStateStores;
-    this.loginPageHtml = options.loginPageHtml;
-    this.onRoutes = options.onRoutes;
-    this.serveStatic = options.serveStatic ?? (!this.cloudflare && !this.edgeone);
-    this.preload = options.preload ?? (!this.cloudflare && !this.edgeone);
+    // GitHub backup relies on Node filesystem/SQLite and is loaded only by the Render/Node runtime.
+    this.accountBackup = this.cloudflare ? undefined : createGitHubAccountBackup(this.accountStore);
+    this.lxSourceManager = options.lxSourceManager ?? loadLocalLxSourceManager();
+    this.serveStatic = options.serveStatic ?? !this.cloudflare;
+    this.preload = options.preload ?? !this.cloudflare;
   }
 
   private shouldExposeOpenApiDocs(): boolean {
@@ -70,6 +62,8 @@ class MultiPlatformServer {
       return this.app!;
     }
 
+    // 先还原云端账号，再建立内存 registry，避免 Render 新实例以空账号启动。
+    await this.accountBackup?.restore();
     await this.registerPlatforms();
 
     this.app = express();
@@ -80,11 +74,13 @@ class MultiPlatformServer {
     this.app.platformFactory = platformFactory;
     this.app.lxSourceManager = this.lxSourceManager;
     this.app.lxSourceUpdateScheduler = createLxSourceUpdateScheduler(this.lxSourceManager);
+    this.app.accountBackup = this.accountBackup;
     this.app.loginRefreshScheduler = createLoginRefreshScheduler({
       registry: this.accountSessions,
       platformFactory,
       accountStore: this.accountStore
     });
+    await this.accountBackup?.start();
     this.logger.compact('info', 'Multi-platform music server initialized', 'debug');
     return this.app;
   }
@@ -115,8 +111,6 @@ class MultiPlatformServer {
     this.app!.use(cookieParser());
     if (this.serveStatic) this.app!.use(express.static(path.join(__dirname, '..', 'public')));
     this.accountSessions = loadAccountSessions(this.accountStore);
-    // 初始化时已经读取过共享存储，首个请求不必立刻再同步一次。
-    this.accountRefreshAt = Date.now();
     (this.accountSessions.onDeleted ??= new Set()).add(session => {
       clearAccountLoginRefresh(session.apiAccessKey);
       clearYTMusicTrackCache(session.cookie);
@@ -141,47 +135,6 @@ class MultiPlatformServer {
 
     this.app!.use(express.json({ limit: '5mb' }));
     this.app!.use(express.urlencoded({ extended: false, limit: '5mb' }));
-
-    // EdgeOne 的 Blob AccountStore 是“内存同步修改 + 异步持久化”。在发送
-    // 写请求响应前完成 flush，避免 Serverless 实例结束后丢失账号变更。
-    if (this.accountStore.flush) {
-      this.app!.use((req: Request, res: Response, next: NextFunction) => {
-        if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
-          next();
-          return;
-        }
-        const originalEnd = res.end.bind(res) as (...args: any[]) => any;
-        let ending = false;
-        (res as any).end = (...args: any[]) => {
-          if (ending) return res;
-          ending = true;
-          void this.accountStore.flush!().then(
-            () => originalEnd(...args),
-            (error) => {
-              this.logger.error('账号状态持久化失败', error);
-              if (res.headersSent) {
-                originalEnd(...args);
-                return;
-              }
-              // 路由可能已经通过 res.json() 设置了旧响应的 Content-Length，
-              // 覆盖响应体时必须一并更新，否则 Node 会截断或挂起连接。
-              const body = JSON.stringify(Result.error('账号状态持久化失败', 500));
-              res.removeHeader('ETag');
-              res.removeHeader('Content-Encoding');
-              res.removeHeader('Content-Range');
-              res.status(500).set({
-                'Content-Type': 'application/json; charset=utf-8',
-                'Content-Length': Buffer.byteLength(body),
-                'Cache-Control': 'no-store'
-              });
-              originalEnd(body);
-            }
-          );
-          return res;
-        };
-        next();
-      });
-    }
   }
 
   async setupRoutes(): Promise<void> {
@@ -191,25 +144,9 @@ class MultiPlatformServer {
       });
     }
 
-    if (this.accountStore.reload) {
-      // 管理后台和登录流程也会校验 api_access_key；定期同步其他实例的
-      // 账号，避免刚在另一实例创建的账号在这里被判定为不存在。
-      this.app!.use(['/app/api', '/login'], async (req: Request, _res: Response, next: NextFunction) => {
-        await this.refreshAccounts(false);
-        const bodyKey = typeof req.body?.api_access_key === 'string'
-          ? req.body.api_access_key.trim()
-          : '';
-        if (bodyKey && !this.accountSessions.byAccessKey.has(bodyKey)
-          && Date.now() - this.accountRefreshAt >= 2_000) {
-          await this.refreshAccounts(true);
-        }
-        next();
-      });
-    }
     this.app!.use('/app/api', createDashboardRouter({
       registry: this.accountSessions,
       cloudflare: this.cloudflare,
-      edgeone: this.edgeone,
       adminManagementPassword: this.adminManagementPassword,
       accountStore: this.accountStore,
       onAccountsChanged: () => this.reconcileLxSources()
@@ -218,21 +155,11 @@ class MultiPlatformServer {
       registry: this.accountSessions,
       platformFactory,
       accountStore: this.accountStore,
-      allowAccountLxSources: !this.cloudflare && !this.edgeone,
-      loginStateStores: this.loginStateStores,
-      loginPageHtml: this.loginPageHtml,
+      allowAccountLxSources: !this.cloudflare,
       onAccountsChanged: () => this.reconcileLxSources()
     }));
     this.app!.use('/v1', async (req: Request, _res: Response, next: NextFunction) => {
       const key = extractAuthorizationToken(req.header('Authorization'));
-      if (this.accountStore.reload) {
-        // 定期同步其他实例写入的账号；新 key 未命中时立即强读一次。
-        await this.refreshAccounts(false);
-        if (key && !this.accountSessions.byAccessKey.has(key)
-          && Date.now() - this.accountRefreshAt >= 2_000) {
-          await this.refreshAccounts(true);
-        }
-      }
       const session = this.accountSessions.byAccessKey.get(key);
       if (!session || session.platform !== 'qq') return next();
       try {
@@ -352,8 +279,6 @@ class MultiPlatformServer {
       });
     });
 
-    this.onRoutes?.(this.app!);
-
     this.app!.use((_req: Request, res: Response) => {
       res.status(404).json(Result.error('API endpoint not found', 404));
     });
@@ -372,82 +297,6 @@ class MultiPlatformServer {
     this.lxSourceManager.reconcileAccountSources(
       this.accountSessions.sessions.map((session) => session.lxSource)
     );
-  }
-
-  /**
-   * 从共享 AccountStore 同步账号。EdgeOne 的多个函数实例各自缓存 registry，
-   * 因此 v1 请求会定期刷新，并在遇到未知 key 时立即强制刷新。
-   */
-  private async refreshAccounts(force: boolean): Promise<void> {
-    const reload = this.accountStore.reload;
-    if (!reload) return;
-    const now = Date.now();
-    if (force) {
-      // 未携带有效 key 的请求也会走到这里；限制强制刷新频率，避免被随机
-      // token 放大成对共享存储的持续读取。
-      if (now - this.accountForceRefreshAt < 2_000) return;
-      this.accountForceRefreshAt = now;
-    } else if (now - this.accountRefreshAt < 30_000) {
-      return;
-    }
-    if (this.accountRefresh) {
-      await this.accountRefresh;
-      return;
-    }
-    this.accountRefresh = (async () => {
-      try {
-        const changed = await reload.call(this.accountStore);
-        if (changed === false) return;
-        const next = loadAccountSessions(this.accountStore);
-        const previous = this.accountSessions.byAccessKey;
-        const merged = next.sessions.map((session) => {
-          const existing = previous.get(session.apiAccessKey);
-          if (!existing || existing.platform !== session.platform) return session;
-          const cookieChanged = existing.cookie !== session.cookie;
-          const previousCookie = existing.cookie;
-          existing.name = session.name;
-          existing.cookie = session.cookie;
-          existing.stateless = session.stateless;
-          existing.useLuoxue = session.useLuoxue;
-          existing.lxSource = session.lxSource;
-          existing.deviceId = session.deviceId;
-          existing.deviceState = session.deviceState;
-          if (cookieChanged) {
-            // 其他实例更新了 Cookie，旧实例的收藏缓存必须失效。
-            existing.favoriteTrackIds.clear();
-            existing.userPlaylistIds.clear();
-            existing.favoriteArtistIds.clear();
-            existing.favoriteAlbumIds.clear();
-            existing.favoriteArtistsLoaded = false;
-            existing.favoriteAlbumsLoaded = false;
-            clearYTMusicTrackCache(previousCookie);
-            clearYTMusicVisitorCache(previousCookie);
-          }
-          return existing;
-        });
-        const nextKeys = new Set(merged.map((session) => session.apiAccessKey));
-        const removed = this.accountSessions.sessions.filter(
-          (session) => !nextKeys.has(session.apiAccessKey)
-        );
-        for (const session of removed) {
-          for (const cleanup of this.accountSessions.onDeleted ?? []) cleanup(session);
-        }
-        this.accountSessions.sessions = merged;
-        this.accountSessions.byAccessKey = new Map(
-          merged.map((session) => [session.apiAccessKey, session])
-        );
-        this.reconcileLxSources();
-      } catch (error) {
-        this.logger.error('同步账号数据库失败', error);
-      } finally {
-        this.accountRefreshAt = Date.now();
-      }
-    })();
-    try {
-      await this.accountRefresh;
-    } finally {
-      this.accountRefresh = undefined;
-    }
   }
 
   async handleResourceAPI(req: Request, res: Response, route: string): Promise<void> {
@@ -501,17 +350,43 @@ export interface CreateAppOptions {
   accountStore?: AccountStore;
   lxSourceManager?: AppLxSourceManager;
   cloudflare?: boolean;
-  edgeone?: boolean;
   serveStatic?: boolean;
   preload?: boolean;
-  loginStateStores?: LoginStateStores;
-  loginPageHtml?: string;
-  /** 注册平台路由之后、404 之前的扩展点（如 EdgeOne 定时任务路由）。 */
-  onRoutes?: (app: Express) => void;
 }
 
 export interface AppLxSourceManager extends LxTrackUrlResolver, LxSourceLifecycle {
   reconcileAccountSources(sourceGroups: readonly (readonly string[])[]): void;
+}
+
+function createGitHubAccountBackup(accountStore: AccountStore): GitHubAccountBackup | undefined {
+  const repo = process.env.GITHUB_DATA_REPO?.trim() || '';
+  const token = process.env.GITHUB_TOKEN?.trim() || '';
+  const encryptionKey = process.env.ACCOUNT_SYNC_KEY || '';
+  // .env.example 會預填 repo 名稱；只有 repo、沒有兩個祕密值時視為尚未啟用。
+  if (!token && !encryptionKey) {
+    console.warn('[account-backup] 尚未設定 GITHUB_TOKEN 與 ACCOUNT_SYNC_KEY，GitHub 備份未啟用');
+    return undefined;
+  }
+  if (!repo || !token || !encryptionKey) {
+    throw new Error('[account-backup] 啟用備份時，GITHUB_DATA_REPO、GITHUB_TOKEN、ACCOUNT_SYNC_KEY 必須全部配置');
+  }
+
+  const parsedInterval = Number(process.env.ACCOUNT_SYNC_INTERVAL_MS || 5000);
+  const localRequire = require;
+  const backupModule = localRequire('./storage/github-backup') as typeof import('./storage/github-backup');
+  return new backupModule.GitHubAccountBackup({
+    store: accountStore,
+    repo,
+    token,
+    encryptionKey,
+    previousEncryptionKeys: process.env.ACCOUNT_SYNC_PREVIOUS_KEY
+      ? [process.env.ACCOUNT_SYNC_PREVIOUS_KEY]
+      : [],
+    branch: process.env.ACCOUNT_SYNC_BRANCH || 'main',
+    filePath: process.env.ACCOUNT_SYNC_PATH || 'accounts/accounts.enc',
+    legacyFilePath: process.env.ACCOUNT_SYNC_LEGACY_PATH || 'accounts/data.db.b64',
+    intervalMs: Number.isFinite(parsedInterval) ? parsedInterval : 5000
+  });
 }
 
 function loadLocalAccountStore(): AccountStore {
