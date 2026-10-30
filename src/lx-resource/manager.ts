@@ -5,6 +5,7 @@ import path from 'node:path';
 import axios from 'axios';
 import type { TrackUrl } from 'aduoer-wow-sdk';
 import type { MusicPlatform } from '../types';
+
 import {
   getLxSourceCacheDirectory,
   getLxSourceCachePath,
@@ -14,8 +15,10 @@ import {
   parseLxScriptInfo,
   sourceLabel
 } from './config';
+
 import { LxSourceRuntime } from './runtime';
 import { getLxQualityPriority } from './quality';
+
 import type {
   LxLogLevel,
   LxSourceCapabilities,
@@ -31,7 +34,13 @@ const SOURCE_REQUEST_TIMEOUT_MS = 5_000;
 const SOURCE_CHAIN_TIMEOUT_MS = 15_000;
 
 const MAX_BACKGROUND_RETRIES = 5;
-const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
+const RETRY_DELAYS_MS = [
+  1000,
+  2000,
+  4000,
+  8000,
+  15000
+];
 
 type RegisteredSource = {
   config: LxSourceConfig;
@@ -49,7 +58,10 @@ type ManagerOptions = {
 };
 
 function contentDigest(content: string): string {
-  return crypto.createHash('sha256').update(content).digest('hex');
+  return crypto
+    .createHash('sha256')
+    .update(content)
+    .digest('hex');
 }
 
 function validateAudioUrl(value: unknown): string {
@@ -58,13 +70,20 @@ function validateAudioUrl(value: unknown): string {
     value.trim().length === 0 ||
     value.length > 2048
   ) {
-    throw new Error('LX source returned an invalid audio URL');
+    throw new Error(
+      'LX source returned an invalid audio URL'
+    );
   }
 
   const url = new URL(value);
 
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('LX source returned a non-HTTP audio URL');
+  if (
+    url.protocol !== 'http:' &&
+    url.protocol !== 'https:'
+  ) {
+    throw new Error(
+      'LX source returned a non-HTTP audio URL'
+    );
   }
 
   return value;
@@ -73,12 +92,16 @@ function validateAudioUrl(value: unknown): string {
 function safeErrorMessage(error: unknown): string {
   if (axios.isAxiosError(error)) {
     const status = error.response?.status;
+
     return status
       ? `${error.code || 'HTTP_ERROR'} (${status})`
       : (error.code || 'network error');
   }
 
-  const message = error instanceof Error ? error.message : String(error);
+  const message =
+    error instanceof Error
+      ? error.message
+      : String(error);
 
   return message
     .replace(/https?:\/\/[^\s]+/g, '[url]')
@@ -89,26 +112,29 @@ export class LxSourceManager
   implements LxTrackUrlResolver, LxSourceLifecycle {
 
   private readonly globalConfigs: LxSourceConfig[];
+
   private configs: LxSourceConfig[];
 
   private readonly cacheDirectory: string;
 
-  private readonly downloadSourceImpl: (url: string) => Promise<string>;
+  private readonly downloadSourceImpl:
+    (url: string) => Promise<string>;
 
-  private readonly sources = new Map<string, RegisteredSource>();
+  private readonly sources =
+    new Map<string, RegisteredSource>();
 
-  private readonly operations = new Map<string, Promise<void>>();
+  private readonly operations =
+    new Map<string, Promise<void>>();
 
-  private readonly retryTimers = new Map<
-    string,
-    ReturnType<typeof setTimeout>
-  >();
+  private readonly retryTimers =
+    new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
-   * 每個音源的背景重試次數。
-   * 初次載入不計入，最多額外重試 5 次。
+   * 初次載入不計入重試次數。
+   * 每條音源最多額外重試 5 次。
    */
-  private readonly retryAttempts = new Map<string, number>();
+  private readonly retryAttempts =
+    new Map<string, number>();
 
   private initialLoad?: Promise<void>;
 
@@ -142,12 +168,14 @@ export class LxSourceManager
           this.loadWithBackgroundRecovery(config)
         )
       )
-    ).then(() => undefined).catch((error) => {
-      console.warn(
-        '[lx-source] initial background load failed',
-        safeErrorMessage(error)
-      );
-    });
+    )
+      .then(() => undefined)
+      .catch((error) => {
+        console.warn(
+          '[lx-source] initial background load failed',
+          safeErrorMessage(error)
+        );
+      });
   }
 
   async waitForInitialLoad(): Promise<void> {
@@ -179,7 +207,7 @@ export class LxSourceManager
 
     this.configs = [...desired.values()];
 
-    // 移除已不需要的音源及其重試任務。
+    // 移除已不需要的音源。
     for (const [hash, source] of this.sources.entries()) {
       if (desired.has(hash)) continue;
 
@@ -188,6 +216,7 @@ export class LxSourceManager
       void source.runtime.drainAndTerminate();
     }
 
+    // 清除已不需要的背景重試。
     for (const [hash, timer] of this.retryTimers.entries()) {
       if (desired.has(hash)) continue;
 
@@ -210,10 +239,9 @@ export class LxSourceManager
   /**
    * 取得歌曲播放網址。
    *
-   * 音質順序完全交給 quality.ts，
-   * 依照 Aduoer App 傳入的 quality 決定第一順位。
-   *
-   * 每個音質最多同時使用 3 條音源。
+   * 同一音質最多 3 條音源並行。
+   * 最快取得有效網址者勝出。
+   * 勝出後取消其他尚未完成的請求。
    */
   async resolveTrackUrl(
     platform: MusicPlatform,
@@ -228,14 +256,18 @@ export class LxSourceManager
 
     const lxPlatform = mapMusicPlatformToLx(platform);
 
-    const deadline = Date.now() + SOURCE_CHAIN_TIMEOUT_MS;
+    const deadline =
+      Date.now() + SOURCE_CHAIN_TIMEOUT_MS;
 
-    const selectedConfigs = new Map<string, LxSourceConfig>();
+    const selectedConfigs =
+      new Map<string, LxSourceConfig>();
 
     // 帳號專屬音源優先。
-    createLxSourceConfigs(accountSources).forEach((config) => {
-      selectedConfigs.set(config.hash, config);
-    });
+    createLxSourceConfigs(accountSources).forEach(
+      (config) => {
+        selectedConfigs.set(config.hash, config);
+      }
+    );
 
     // 全域音源補足。
     this.globalConfigs.forEach((config) => {
@@ -244,7 +276,10 @@ export class LxSourceManager
       }
     });
 
-    const activeSources = [...selectedConfigs.values()]
+    // 最多取 3 條符合平台能力的音源。
+    const activeSources = [
+      ...selectedConfigs.values()
+    ]
       .map((config) => ({
         config,
         source: this.sources.get(config.hash)
@@ -255,7 +290,9 @@ export class LxSourceManager
         ): item is {
           config: LxSourceConfig;
           source: RegisteredSource;
-        } => Boolean(item.source?.capabilities[lxPlatform])
+        } => Boolean(
+          item.source?.capabilities[lxPlatform]
+        )
       )
       .slice(0, 3);
 
@@ -271,7 +308,7 @@ export class LxSourceManager
       )
     ];
 
-    // 由 App 要求的音質決定候選順序。
+    // 依照 App 要求的音質決定查詢順序。
     const qualityCandidates = getLxQualityPriority(
       platform,
       quality,
@@ -286,7 +323,7 @@ export class LxSourceManager
       `App 音質要求=${quality || 'default'}，查詢順序=${qualityCandidates.join(' → ')}`
     );
 
-    // 逐級音質嘗試。
+    // 逐級嘗試音質。
     for (const lxQuality of qualityCandidates) {
       const remaining = deadline - Date.now();
 
@@ -297,11 +334,15 @@ export class LxSourceManager
           'timeout',
           '音源查詢超過總時間限制'
         );
+
         break;
       }
 
-      const eligible = activeSources.filter(({ source }) =>
-        source.capabilities[lxPlatform]?.qualities.includes(lxQuality)
+      const eligible = activeSources.filter(
+        ({ source }) =>
+          source.capabilities[lxPlatform]?.qualities.includes(
+            lxQuality
+          )
       );
 
       if (eligible.length === 0) continue;
@@ -313,61 +354,80 @@ export class LxSourceManager
         `開始查詢 ${lxQuality}，並發音源數=${eligible.length}`
       );
 
-      const attempts = eligible.map(({ config, source }) => {
-        const startedAt = Date.now();
+      // 同一音質共用一個取消控制器。
+      const controller = new AbortController();
 
-        return source.runtime.invoke({
-          source: lxPlatform,
-          quality: lxQuality,
-          timeoutMs: Math.min(
-            SOURCE_REQUEST_TIMEOUT_MS,
-            remaining
-          ),
-          musicInfo: {
-            id,
-            songmid: id,
-            ...(lxPlatform === 'tx'
-              ? { strMediaMid: id }
-              : {}),
-            source: lxPlatform,
-            types: source.capabilities[lxPlatform]!.qualities.map(
-              (type) => ({
-                type,
-                size: null
-              })
-            )
-          }
-        }).then((result) => {
-          const audioUrl = validateAudioUrl(result);
+      const attempts = eligible.map(
+        ({ config, source }) => {
+          const startedAt = Date.now();
 
-          const elapsed = Date.now() - startedAt;
+          return source.runtime.invoke(
+            {
+              source: lxPlatform,
+              quality: lxQuality,
+              timeoutMs: Math.min(
+                SOURCE_REQUEST_TIMEOUT_MS,
+                remaining
+              ),
+              musicInfo: {
+                id,
+                songmid: id,
+                ...(lxPlatform === 'tx'
+                  ? { strMediaMid: id }
+                  : {}),
+                source: lxPlatform,
+                types: source.capabilities[
+                  lxPlatform
+                ]!.qualities.map((type) => ({
+                  type,
+                  size: null
+                }))
+              }
+            },
+            controller.signal
+          )
+            .then((result) => {
+              const audioUrl = validateAudioUrl(result);
 
-          this.log(
-            'info',
-            source.name,
-            config.hash,
-            `${lxQuality} 有效網址取得成功，耗時 ${elapsed}ms`
-          );
+              const elapsed = Date.now() - startedAt;
 
-          return mapLxQualityToTrackUrl(
-            audioUrl,
-            lxQuality
-          );
-        }).catch((error: unknown) => {
-          this.log(
-            'warn',
-            source.name,
-            config.hash,
-            `${lxQuality} 請求失敗：${safeErrorMessage(error)}`
-          );
+              this.log(
+                'info',
+                source.name,
+                config.hash,
+                `${lxQuality} 有效網址取得成功，耗時 ${elapsed}ms`
+              );
 
-          throw error;
-        });
-      });
+              return mapLxQualityToTrackUrl(
+                audioUrl,
+                lxQuality
+              );
+            })
+            .catch((error: unknown) => {
+              this.log(
+                'warn',
+                source.name,
+                config.hash,
+                `${lxQuality} 請求失敗：${safeErrorMessage(error)}`
+              );
+
+              throw error;
+            });
+        }
+      );
 
       try {
-        // 同一音質下，最快成功的有效網址優先。
-        return await Promise.any(attempts);
+        // 第一個成功的有效結果優先。
+        const result = await Promise.any(attempts);
+
+        this.log(
+          'info',
+          'quality',
+          'winner',
+          `${lxQuality} 已取得有效網址，取消其他未完成音源請求`
+        );
+
+        return result;
       } catch {
         this.log(
           'warn',
@@ -375,6 +435,11 @@ export class LxSourceManager
           'fallback',
           `${lxQuality} 所有可用音源都失敗，準備嘗試下一檔位`
         );
+      } finally {
+        // 無論成功或失敗，都清理同檔位其他請求。
+        if (!controller.signal.aborted) {
+          controller.abort();
+        }
       }
     }
 
@@ -402,6 +467,7 @@ export class LxSourceManager
     }
 
     this.retryTimers.clear();
+    this.retryAttempts.clear();
 
     await Promise.allSettled([
       ...this.operations.values()
@@ -419,11 +485,9 @@ export class LxSourceManager
   }
 
   /**
-   * 初次載入。
-   *
-   * 先使用本地快取。
-   * 快取註冊失敗才重新下載。
-   * 失敗交給背景恢復機制處理。
+   * 初次載入：
+   * 先讀取本地快取。
+   * 快取失敗才重新下載。
    */
   private async loadAtStartup(
     config: LxSourceConfig
@@ -447,7 +511,9 @@ export class LxSourceManager
         'utf8'
       );
 
-      cachedName = parseLxScriptInfo(cachedScript).name;
+      cachedName = parseLxScriptInfo(
+        cachedScript
+      ).name;
 
       await this.registerScript(
         config,
@@ -456,7 +522,9 @@ export class LxSourceManager
       );
 
       if (!this.sources.has(config.hash)) {
-        throw new Error('快取音源初始化後未成功註冊');
+        throw new Error(
+          '快取音源初始化後未成功註冊'
+        );
       }
 
       return;
@@ -478,9 +546,8 @@ export class LxSourceManager
     let downloadedName = '';
 
     try {
-      const downloadedScript = await this.downloadSourceImpl(
-        config.url
-      );
+      const downloadedScript =
+        await this.downloadSourceImpl(config.url);
 
       downloadedName = parseLxScriptInfo(
         downloadedScript
@@ -493,7 +560,9 @@ export class LxSourceManager
       );
 
       if (!this.sources.has(config.hash)) {
-        throw new Error('下載音源初始化後未成功註冊');
+        throw new Error(
+          '下載音源初始化後未成功註冊'
+        );
       }
     } catch (error) {
       this.log(
@@ -508,8 +577,8 @@ export class LxSourceManager
   }
 
   /**
-   * 初次失敗時，不阻塞主程式啟動。
-   * 交由背景排程最多重試 5 次。
+   * 初次失敗不阻塞主程式。
+   * 交由背景排程重試。
    */
   private async loadWithBackgroundRecovery(
     config: LxSourceConfig
@@ -532,10 +601,10 @@ export class LxSourceManager
   }
 
   /**
-   * 背景註冊恢復。
+   * 背景恢復：
+   * 初次失敗後最多額外重試 5 次。
    *
-   * 初次載入之外最多額外重試 5 次。
-   * 間隔：1、2、4、8、15 秒。
+   * 延遲：1、2、4、8、15 秒。
    */
   private scheduleRecovery(
     config: LxSourceConfig,
@@ -551,10 +620,8 @@ export class LxSourceManager
       return;
     }
 
-    // 已經有可用音源時不重複註冊。
     if (this.sources.has(config.hash)) return;
 
-    // 同一音源只允許一個重試計時器。
     if (this.retryTimers.has(config.hash)) return;
 
     const attempts =
@@ -567,6 +634,7 @@ export class LxSourceManager
         config.hash,
         `背景恢復已達上限 ${MAX_BACKGROUND_RETRIES} 次，停止重試`
       );
+
       return;
     }
 
@@ -579,7 +647,9 @@ export class LxSourceManager
 
     const delay =
       RETRY_DELAYS_MS[nextAttempt - 1] ??
-      RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1];
+      RETRY_DELAYS_MS[
+        RETRY_DELAYS_MS.length - 1
+      ];
 
     this.log(
       'warn',
@@ -617,7 +687,9 @@ export class LxSourceManager
           await this.loadAtStartup(config);
 
           if (!this.sources.has(config.hash)) {
-            throw new Error('重新註冊後音源仍未啟用');
+            throw new Error(
+              '重新註冊後音源仍未啟用'
+            );
           }
 
           this.log(
@@ -650,6 +722,10 @@ export class LxSourceManager
     );
   }
 
+  /**
+   * 更新音源。
+   * 更新失敗時保留原本正常運作的版本。
+   */
   private async updateSource(
     config: LxSourceConfig
   ): Promise<void> {
@@ -672,6 +748,7 @@ export class LxSourceManager
           config.hash,
           '源內容無變化'
         );
+
         return;
       }
 
@@ -684,7 +761,9 @@ export class LxSourceManager
       const updated = this.sources.get(config.hash);
 
       if (!updated) {
-        throw new Error('更新後音源未成功註冊');
+        throw new Error(
+          '更新後音源未成功註冊'
+        );
       }
 
       this.log(
@@ -705,9 +784,6 @@ export class LxSourceManager
 
   /**
    * 初始化、驗證及註冊音源。
-   *
-   * Worker 初始化成功不代表一定能正常啟用。
-   * 因此在註冊前後都檢查 Worker 是否已異常退出。
    */
   private async registerScript(
     config: LxSourceConfig,
@@ -718,8 +794,12 @@ export class LxSourceManager
       throw new Error('LX source script is empty');
     }
 
-    if (Buffer.byteLength(script) > MAX_SOURCE_BYTES) {
-      throw new Error('LX source script exceeds 5 MiB');
+    if (
+      Buffer.byteLength(script) > MAX_SOURCE_BYTES
+    ) {
+      throw new Error(
+        'LX source script exceeds 5 MiB'
+      );
     }
 
     if (this.stopped) return;
@@ -732,7 +812,8 @@ export class LxSourceManager
     const runtime = new LxSourceRuntime({
       script,
       sourceInfo,
-      initializationTimeoutMs: INITIALIZATION_TIMEOUT_MS,
+      initializationTimeoutMs:
+        INITIALIZATION_TIMEOUT_MS,
 
       onLog: (level, message) => {
         this.log(
@@ -760,11 +841,9 @@ export class LxSourceManager
           'error',
           current.name,
           config.hash,
-          `Worker 異常退出：${safeErrorMessage(event.error)}`
+          `Worker 異常退出，退出代碼=${event.code}`
         );
 
-        // 已註冊的 Worker 異常退出後，
-        // 自動進入背景恢復程序。
         this.scheduleRecovery(
           config,
           'Worker 註冊後異常退出'
@@ -777,18 +856,23 @@ export class LxSourceManager
     try {
       initialization = await runtime.initialize();
 
-      if (runtimeExited) {
-        throw new Error('Worker 初始化後立即退出');
+      if (runtimeExited || runtime.isStopped) {
+        throw new Error(
+          'Worker 初始化後立即退出'
+        );
       }
 
-      runtimeLogName = initialization.sourceInfo.name;
+      runtimeLogName =
+        initialization.sourceInfo.name;
 
       if (persist) {
         await this.persistScript(config, script);
       }
 
-      if (runtimeExited) {
-        throw new Error('Worker 在持久化期間異常退出');
+      if (runtimeExited || runtime.isStopped) {
+        throw new Error(
+          'Worker 在持久化期間異常退出'
+        );
       }
     } catch (error) {
       await runtime.terminate();
@@ -809,9 +893,12 @@ export class LxSourceManager
       return;
     }
 
-    if (runtimeExited) {
+    if (runtimeExited || runtime.isStopped) {
       await runtime.terminate();
-      throw new Error('Worker 未能保持正常啟用狀態');
+
+      throw new Error(
+        'Worker 未能保持正常啟用狀態'
+      );
     }
 
     const previous = this.sources.get(config.hash);
@@ -829,25 +916,38 @@ export class LxSourceManager
       registered
     );
 
-    // 確認註冊表確實持有此 Worker。
     if (
       this.sources.get(config.hash)?.runtime !== runtime ||
-      runtimeExited
+      runtimeExited ||
+      runtime.isStopped
     ) {
-      this.sources.delete(config.hash);
+      if (
+        this.sources.get(config.hash)?.runtime === runtime
+      ) {
+        this.sources.delete(config.hash);
+      }
 
       await runtime.terminate();
 
-      throw new Error('音源註冊後未能保持啟用');
+      throw new Error(
+        '音源註冊後未能保持啟用'
+      );
     }
+
+    // 成功註冊後重置重試狀態。
+    // 日後若 Worker 再次異常退出，可重新獲得 5 次重試。
+    const existingTimer = this.retryTimers.get(config.hash);
+
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.retryTimers.delete(config.hash);
+    }
+
+    this.retryAttempts.delete(config.hash);
 
     const platforms = Object.keys(
       initialization.capabilities
-    ).filter((key) => (
-      initialization.capabilities[
-        key as keyof LxSourceCapabilities
-      ]
-    ));
+    );
 
     this.log(
       'info',
@@ -856,7 +956,8 @@ export class LxSourceManager
       `註冊成功，支持 ${platforms.join('/')}`
     );
 
-    if (previous) {
+    // 新版本成功後，才停止舊版本。
+    if (previous && previous.runtime !== runtime) {
       void previous.runtime.drainAndTerminate();
     }
   }
@@ -894,7 +995,10 @@ export class LxSourceManager
         target
       );
     } catch (error) {
-      await fs.unlink(temporary).catch(() => undefined);
+      await fs.unlink(temporary).catch(
+        () => undefined
+      );
+
       throw error;
     }
   }
@@ -918,7 +1022,9 @@ export class LxSourceManager
     const buffer = Buffer.from(response.data);
 
     if (buffer.byteLength > MAX_SOURCE_BYTES) {
-      throw new Error('LX source script exceeds 5 MiB');
+      throw new Error(
+        'LX source script exceeds 5 MiB'
+      );
     }
 
     return buffer.toString('utf8');
@@ -970,7 +1076,8 @@ export class LxSourceManager
     hash: string,
     message: string
   ): void {
-    const prefix = `[lx-source:${sourceLabel(name, hash)}]`;
+    const prefix =
+      `[lx-source:${sourceLabel(name, hash)}]`;
 
     const output = `${prefix} ${message}`;
 
