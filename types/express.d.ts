@@ -1,5 +1,6 @@
 import { Server } from 'http';
 import type { LoginRefreshScheduler } from '../src/loginRefresh';
+import type { GitHubAccountBackup } from '../src/storage/github-backup';
 import type {
   LxSourceLifecycle,
   LxTrackUrlResolver,
@@ -12,6 +13,7 @@ declare global {
       server?: Server;
       platformFactory?: any;
       loginRefreshScheduler?: LoginRefreshScheduler;
+      accountBackup?: GitHubAccountBackup;
       lxSourceManager?: LxSourceLifecycle & LxTrackUrlResolver;
       lxSourceUpdateScheduler?: LxSourceUpdateScheduler;
     }
