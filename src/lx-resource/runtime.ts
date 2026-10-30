@@ -1,3 +1,4 @@
+
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
@@ -6,6 +7,8 @@ import type {
   LxLogLevel,
   LxScriptInfo,
   LxWorkerInvocation,
+  LxWorkerInitialization,
+  LxPlatformCapability,
   LxQuality
 } from './types';
 
@@ -25,20 +28,6 @@ type RuntimeOptions = {
   onExit?: (event: { code: number; expected: boolean }) => void;
 };
 
-type RuntimeCapability = {
-  type: string;
-  actions: string[];
-  qualitys: LxQuality[];
-};
-
-type RuntimeInitialization = {
-  sourceInfo: LxScriptInfo;
-  capabilities: {
-    tx?: RuntimeCapability;
-    wy?: RuntimeCapability;
-  };
-};
-
 type WorkerMessage = {
   type: string;
   requestId?: string;
@@ -53,7 +42,7 @@ type WorkerMessage = {
 const DEFAULT_INITIALIZATION_TIMEOUT_MS = 10_000;
 const DEFAULT_INVOCATION_TIMEOUT_MS = 5_000;
 
-const LX_QUALITIES: LxQuality[] = [
+const LX_QUALITIES: readonly LxQuality[] = [
   '128k',
   '320k',
   'flac',
@@ -67,31 +56,36 @@ function isRecord(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function normalizeCapability(value: unknown): RuntimeCapability | undefined {
+function normalizeCapability(
+  value: unknown
+): LxPlatformCapability | undefined {
   if (!isRecord(value)) return undefined;
 
   if (value.type !== 'music') return undefined;
 
-  if (!Array.isArray(value.actions) || !value.actions.includes('musicUrl')) {
+  if (
+    !Array.isArray(value.actions) ||
+    !value.actions.includes('musicUrl')
+  ) {
     return undefined;
   }
 
   if (!Array.isArray(value.qualitys)) return undefined;
 
-  const qualitys = value.qualitys.filter(
+  const qualities = value.qualitys.filter(
     (quality: unknown): quality is LxQuality =>
       typeof quality === 'string' &&
       LX_QUALITIES.includes(quality as LxQuality)
   );
 
-  if (qualitys.length === 0) return undefined;
+  if (qualities.length === 0) return undefined;
 
   return {
-    type: value.type,
     actions: value.actions.filter(
-      (action: unknown): action is string => typeof action === 'string'
+      (action: unknown): action is string =>
+        typeof action === 'string'
     ),
-    qualitys: [...new Set(qualitys)]
+    qualities: [...new Set(qualities)]
   };
 }
 
@@ -99,7 +93,7 @@ function normalizeInitialization(
   data: unknown,
   sourceInfo: LxScriptInfo,
   hasRequestHandler: boolean
-): RuntimeInitialization {
+): LxWorkerInitialization {
   if (!hasRequestHandler) {
     throw new Error('LX source has not registered a request handler');
   }
@@ -117,7 +111,9 @@ function normalizeInitialization(
   }
 
   if (!isRecord(data.sources)) {
-    throw new Error('LX source initialization did not provide sources');
+    throw new Error(
+      'LX source initialization did not provide sources'
+    );
   }
 
   const tx = normalizeCapability(data.sources.tx);
@@ -127,10 +123,14 @@ function normalizeInitialization(
     throw new Error('LX source does not support musicUrl');
   }
 
+  const returnedInfo = isRecord(data.sourceInfo)
+    ? data.sourceInfo
+    : {};
+
   return {
     sourceInfo: {
       ...sourceInfo,
-      ...(isRecord(data.sourceInfo) ? data.sourceInfo : {})
+      ...returnedInfo
     },
     capabilities: {
       ...(tx ? { tx } : {}),
@@ -158,7 +158,7 @@ export class LxSourceRuntime {
 
   private readonly sourceInfo: LxScriptInfo;
 
-  private initialization?: Promise<RuntimeInitialization>;
+  private initialization?: Promise<LxWorkerInitialization>;
 
   private initialized = false;
 
@@ -170,6 +170,7 @@ export class LxSourceRuntime {
 
   constructor(options: RuntimeOptions) {
     this.sourceInfo = options.sourceInfo;
+
     this.initializationTimeoutMs =
       options.initializationTimeoutMs ??
       DEFAULT_INITIALIZATION_TIMEOUT_MS;
@@ -208,7 +209,7 @@ export class LxSourceRuntime {
     return this.initialized;
   }
 
-  initialize(): Promise<RuntimeInitialization> {
+  initialize(): Promise<LxWorkerInitialization> {
     if (this.initialization) {
       return this.initialization;
     }
@@ -219,24 +220,34 @@ export class LxSourceRuntime {
       );
     }
 
-    this.initialization = new Promise<RuntimeInitialization>(
+    this.initialization = new Promise<LxWorkerInitialization>(
       (resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(
-            new Error(
-              `LX source initialization timeout after ${this.initializationTimeoutMs}ms`
-            )
-          );
+        let settled = false;
 
-          void this.terminate();
-        }, this.initializationTimeoutMs);
+        const cleanup = () => {
+          clearTimeout(timer);
+          this.worker.off('message', messageListener);
+          this.worker.off('exit', exitListener);
+          this.worker.off('error', errorListener);
+        };
 
-        const originalHandleMessage = this.handleMessage.bind(this);
+        const finishResolve = (value: LxWorkerInitialization) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          this.initialized = true;
+          resolve(value);
+        };
 
-        const initializationHandler = (message: WorkerMessage) => {
+        const finishReject = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(error);
+        };
+
+        const messageListener = (message: WorkerMessage) => {
           if (message.type === 'initialized') {
-            clearTimeout(timer);
-
             try {
               const result = normalizeInitialization(
                 message.data,
@@ -244,10 +255,9 @@ export class LxSourceRuntime {
                 message.hasRequestHandler === true
               );
 
-              this.initialized = true;
-              resolve(result);
+              finishResolve(result);
             } catch (error) {
-              reject(
+              finishReject(
                 error instanceof Error
                   ? error
                   : new Error(String(error))
@@ -260,46 +270,41 @@ export class LxSourceRuntime {
           }
 
           if (message.type === 'initializationError') {
-            clearTimeout(timer);
-
-            reject(
+            finishReject(
               new Error(
                 message.error || 'LX source initialization failed'
               )
             );
 
             void this.terminate();
-            return;
           }
-
-          originalHandleMessage(message);
         };
 
-        const messageListener = (message: WorkerMessage) => {
-          initializationHandler(message);
+        const exitListener = (code: number) => {
+          finishReject(
+            new Error(
+              `LX source worker exited before initialization (code ${code})`
+            )
+          );
         };
+
+        const errorListener = (error: Error) => {
+          finishReject(error);
+        };
+
+        const timer = setTimeout(() => {
+          finishReject(
+            new Error(
+              `LX source initialization timeout after ${this.initializationTimeoutMs}ms`
+            )
+          );
+
+          void this.terminate();
+        }, this.initializationTimeoutMs);
 
         this.worker.on('message', messageListener);
-
-        const cleanup = () => {
-          this.worker.off('message', messageListener);
-          clearTimeout(timer);
-        };
-
-        this.worker.once('exit', () => {
-          cleanup();
-
-          if (!this.initialized) {
-            reject(
-              new Error('LX source worker exited before initialization')
-            );
-          }
-        });
-
-        this.worker.once('error', (error: Error) => {
-          cleanup();
-          reject(error);
-        });
+        this.worker.once('exit', exitListener);
+        this.worker.once('error', errorListener);
       }
     );
 
@@ -334,8 +339,6 @@ export class LxSourceRuntime {
         ? invocation.timeoutMs
         : DEFAULT_INVOCATION_TIMEOUT_MS;
 
-    const { timeoutMs: _timeoutMs, ...workerInvocation } = invocation;
-
     return new Promise<unknown>((resolve, reject) => {
       const cleanup = (pending: PendingInvocation) => {
         clearTimeout(pending.timer);
@@ -369,7 +372,9 @@ export class LxSourceRuntime {
 
       const timer = setTimeout(() => {
         cancel(
-          new Error(`LX source request timeout after ${timeoutMs}ms`)
+          new Error(
+            `LX source request timeout after ${timeoutMs}ms`
+          )
         );
       }, timeoutMs);
 
@@ -398,7 +403,11 @@ export class LxSourceRuntime {
         this.worker.postMessage({
           type: 'invoke',
           requestId,
-          invocation: workerInvocation
+          invocation: {
+            source: invocation.source,
+            quality: invocation.quality,
+            musicInfo: invocation.musicInfo
+          }
         });
       } catch (error) {
         this.pending.delete(requestId);
@@ -501,11 +510,6 @@ export class LxSourceRuntime {
 
   private handleWorkerError(error: Error): void {
     this.rejectPending(error);
-
-    if (!this.initialized) {
-      this.initialization = Promise.reject(error);
-      void this.initialization.catch(() => undefined);
-    }
   }
 
   private handleExit(code: number): void {
