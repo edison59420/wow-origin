@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { DatabaseSync, StatementSync } from 'node:sqlite';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type { RawMusicAccount } from '../accounts';
 
 export interface AccountStore {
@@ -9,10 +9,8 @@ export interface AccountStore {
   insert(account: RawMusicAccount): void;
   delete(apiAccessKey: string): void;
   update(apiAccessKey: string, changes: Partial<RawMusicAccount>): void;
-  /** 持久化缓冲的写入，由异步写入的存储实现。 */
-  flush?(): Promise<void>;
-  /** 重新读取底层存储；数据没有变化时返回 false。 */
-  reload?(): Promise<boolean | void>;
+  replaceAll?(accounts: RawMusicAccount[]): void;
+  setChangeListener?(listener?: () => void): void;
 }
 
 type StoredAccountRow = {
@@ -112,15 +110,13 @@ export class SqliteAccountStore implements AccountStore {
   readonly location: string;
   private readonly database: DatabaseSync;
   private readonly insertStatement: StatementSync;
+  private changeListener?: () => void;
 
   constructor(workDir: string = process.cwd()) {
     this.location = sqliteAccountsFilePath(workDir);
     fs.mkdirSync(path.dirname(this.location), { recursive: true });
     migrateLegacySqliteFile(workDir, this.location);
-    // Load lazily so bundlers targeting runtimes without node:sqlite can still
-    // import this module when a different AccountStore is supplied.
-    const { DatabaseSync: SqliteDatabase } = require('node:sqlite') as typeof import('node:sqlite');
-    this.database = new SqliteDatabase(this.location);
+    this.database = new DatabaseSync(this.location);
     this.database.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
     this.database.exec(SCHEMA);
     const columns = this.database.prepare('PRAGMA table_info(accounts)').all() as Array<{ name: string }>;
@@ -150,6 +146,7 @@ export class SqliteAccountStore implements AccountStore {
 
   insert(account: RawMusicAccount): void {
     this.insertStatement.run(...accountValues(account));
+    this.changeListener?.();
   }
 
   update(apiAccessKey: string, changes: Partial<RawMusicAccount>): void {
@@ -169,10 +166,37 @@ export class SqliteAccountStore implements AccountStore {
           use_luoxue = ?, lx_source = ?, deviceId = ?, device_state = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(...accountValues(account), row.id);
+    this.changeListener?.();
   }
 
   delete(apiAccessKey: string): void {
     this.database.prepare('DELETE FROM accounts WHERE api_access_key = ?').run(apiAccessKey);
+    this.changeListener?.();
+  }
+
+  /** 原子替换账号快照；仅用于从加密远端备份还原。 */
+  replaceAll(accounts: RawMusicAccount[]): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.database.exec('DELETE FROM accounts');
+      const seen = new Set<string>();
+      for (const account of accounts) {
+        if (!account || typeof account !== 'object') continue;
+        const key = String(account.api_access_key || '').trim();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        this.insertStatement.run(...accountValues(account));
+      }
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+    this.changeListener?.();
+  }
+
+  setChangeListener(listener?: () => void): void {
+    this.changeListener = listener;
   }
 
   close(): void {
