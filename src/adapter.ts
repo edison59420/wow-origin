@@ -61,29 +61,34 @@ export function createAdapter(
     account.favoriteAlbumsLoaded = true;
     return albums;
   };
-  if (client instanceof YTMusicClient || account.useLuoxue === false || !lxTrackUrlResolver) return client;
+  if (client instanceof YTMusicClient) return client;
 
-  const defaultGetTrackUrl = client.getTrackUrlForQuality.bind(client);
+  // QQ／網易雲只負責歌曲資料與搜尋；播放網址只允許由落雪音源提供。
+  // 不再呼叫 client 原本的官方 getTrackUrlForQuality 作為 fallback。
   const getLxTrackUrl = async (id: string, quality?: string): Promise<TrackUrl | undefined> => {
+    if (!lxTrackUrlResolver || account.useLuoxue === false) return undefined;
     if (account.platform === 'netease' && quality === 'jyeffect') return undefined;
     if (account.platform === 'qq' && ['atmos2', 'atmos51', 'dolby'].includes(quality || '')) return undefined;
+
     try {
-      const lxTrackUrl = await lxTrackUrlResolver.resolveTrackUrl(account.platform, id, quality, account.lxSource || [], { allowFallback: false });
-      if (hasValidAudioUrl(lxTrackUrl)) return lxTrackUrl;
-      if (lxTrackUrl) {
-        console.warn('[lx-source] resolver returned an invalid audio URL, using official track URL flow');
-      }
-    } catch {
-      console.warn('[lx-source] unexpected resolver failure, using official track URL flow');
+      const lxTrackUrl = await lxTrackUrlResolver.resolveTrackUrl(
+        account.platform,
+        id,
+        quality,
+        account.lxSource || [],
+        { allowFallback: false }
+      );
+      return hasValidAudioUrl(lxTrackUrl) ? lxTrackUrl : undefined;
+    } catch (error) {
+      console.warn('[lx-source] 落雪音源請求失敗；已停用官方播放源 fallback', error);
+      return undefined;
     }
-    return undefined;
   };
 
-  // 每个档位先尝试洛雪和官方；降级统一由 client 按歌曲详情决定。
   client.getTrackUrlForQuality = async (id: string, quality: string) => {
     const lxTrackUrl = await getLxTrackUrl(id, quality);
     if (lxTrackUrl) return lxTrackUrl;
-    return defaultGetTrackUrl(id, quality);
+    throw new Error(`No playable Luoxue audio URL for ${account.platform} quality ${quality}; official fallback is disabled`);
   };
   return client;
 }

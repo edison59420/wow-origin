@@ -8,7 +8,6 @@ import { preloadData } from './onload';
 import { APIError } from './errors';
 import { AccountSessionRegistry, extractAuthorizationToken, loadAccountSessions } from './accounts';
 import type { AccountStore } from './storage';
-import type { GitHubAccountBackup } from './storage/github-backup';
 import { createLoginRouter } from './login';
 import { createDashboardRouter } from './dashboard';
 import { createLoginRefreshScheduler, ensureQQLoginFresh, clearAccountLoginRefresh } from './loginRefresh';
@@ -35,7 +34,6 @@ class MultiPlatformServer {
   private accountSessions: AccountSessionRegistry = { sessions: [], byAccessKey: new Map() };
   private readonly lxSourceManager: AppLxSourceManager;
   private readonly accountStore: AccountStore;
-  private readonly accountBackup?: GitHubAccountBackup;
   private readonly cloudflare: boolean;
   private readonly serveStatic: boolean;
   private readonly preload: boolean;
@@ -45,10 +43,8 @@ class MultiPlatformServer {
     this.adminManagementPassword = options.adminManagementPassword ?? process.env.ADMIN_MANAGEMENT_PASSWORD ?? '';
     this.logger = new Logger({ component: 'server' });
     this.accountStore = options.accountStore ?? loadLocalAccountStore();
-    this.cloudflare = options.cloudflare === true;
-    // GitHub backup relies on Node filesystem/SQLite and is loaded only by the Render/Node runtime.
-    this.accountBackup = this.cloudflare ? undefined : createGitHubAccountBackup(this.accountStore);
     this.lxSourceManager = options.lxSourceManager ?? loadLocalLxSourceManager();
+    this.cloudflare = options.cloudflare === true;
     this.serveStatic = options.serveStatic ?? !this.cloudflare;
     this.preload = options.preload ?? !this.cloudflare;
   }
@@ -62,8 +58,6 @@ class MultiPlatformServer {
       return this.app!;
     }
 
-    // 先还原云端账号，再建立内存 registry，避免 Render 新实例以空账号启动。
-    await this.accountBackup?.restore();
     await this.registerPlatforms();
 
     this.app = express();
@@ -74,13 +68,11 @@ class MultiPlatformServer {
     this.app.platformFactory = platformFactory;
     this.app.lxSourceManager = this.lxSourceManager;
     this.app.lxSourceUpdateScheduler = createLxSourceUpdateScheduler(this.lxSourceManager);
-    this.app.accountBackup = this.accountBackup;
     this.app.loginRefreshScheduler = createLoginRefreshScheduler({
       registry: this.accountSessions,
       platformFactory,
       accountStore: this.accountStore
     });
-    await this.accountBackup?.start();
     this.logger.compact('info', 'Multi-platform music server initialized', 'debug');
     return this.app;
   }
@@ -315,6 +307,16 @@ class MultiPlatformServer {
         }
       }
 
+      // QQ／網易雲官方播放 URL 路由停用，避免落雪失敗後或舊版 API 再向官方音源請求。
+      if (['song_url', 'song_url_v1', 'song_url_xeapi'].includes(route)) {
+        const disabledResult = Result.error(
+          '官方播放源已停用；請使用 Aduoer Wow v1 落雪音源播放流程',
+          503
+        );
+        res.status(disabledResult.code).json(disabledResult);
+        return;
+      }
+
       const platformName = (req.query.platform as string) || req.body?.platform || 'netease';
 
       const platform = platformFactory.getPlatform(platformName);
@@ -356,37 +358,6 @@ export interface CreateAppOptions {
 
 export interface AppLxSourceManager extends LxTrackUrlResolver, LxSourceLifecycle {
   reconcileAccountSources(sourceGroups: readonly (readonly string[])[]): void;
-}
-
-function createGitHubAccountBackup(accountStore: AccountStore): GitHubAccountBackup | undefined {
-  const repo = process.env.GITHUB_DATA_REPO?.trim() || '';
-  const token = process.env.GITHUB_TOKEN?.trim() || '';
-  const encryptionKey = process.env.ACCOUNT_SYNC_KEY || '';
-  // .env.example 會預填 repo 名稱；只有 repo、沒有兩個祕密值時視為尚未啟用。
-  if (!token && !encryptionKey) {
-    console.warn('[account-backup] 尚未設定 GITHUB_TOKEN 與 ACCOUNT_SYNC_KEY，GitHub 備份未啟用');
-    return undefined;
-  }
-  if (!repo || !token || !encryptionKey) {
-    throw new Error('[account-backup] 啟用備份時，GITHUB_DATA_REPO、GITHUB_TOKEN、ACCOUNT_SYNC_KEY 必須全部配置');
-  }
-
-  const parsedInterval = Number(process.env.ACCOUNT_SYNC_INTERVAL_MS || 5000);
-  const localRequire = require;
-  const backupModule = localRequire('./storage/github-backup') as typeof import('./storage/github-backup');
-  return new backupModule.GitHubAccountBackup({
-    store: accountStore,
-    repo,
-    token,
-    encryptionKey,
-    previousEncryptionKeys: process.env.ACCOUNT_SYNC_PREVIOUS_KEY
-      ? [process.env.ACCOUNT_SYNC_PREVIOUS_KEY]
-      : [],
-    branch: process.env.ACCOUNT_SYNC_BRANCH || 'main',
-    filePath: process.env.ACCOUNT_SYNC_PATH || 'accounts/accounts.enc',
-    legacyFilePath: process.env.ACCOUNT_SYNC_LEGACY_PATH || 'accounts/data.db.b64',
-    intervalMs: Number.isFinite(parsedInterval) ? parsedInterval : 5000
-  });
 }
 
 function loadLocalAccountStore(): AccountStore {
