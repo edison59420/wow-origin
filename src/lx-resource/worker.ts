@@ -44,6 +44,7 @@ const EVENT_NAMES = {
 const SUPPORTED_EVENTS = new Set(Object.values(EVENT_NAMES));
 const invocationContext = new AsyncLocalStorage<string>();
 const invocationRequests = new Map<string, Set<AbortController>>();
+const cancelledInvocations = new Set<string>();
 const allRequests = new Set<AbortController>();
 let requestHandler: ((data: unknown) => unknown) | undefined;
 let initialized = false;
@@ -91,9 +92,13 @@ function registerController(controller: AbortController): () => void {
   allRequests.add(controller);
   const invocationId = invocationContext.getStore();
   if (invocationId) {
-    const controllers = invocationRequests.get(invocationId) ?? new Set<AbortController>();
-    controllers.add(controller);
-    invocationRequests.set(invocationId, controllers);
+    if (cancelledInvocations.has(invocationId)) {
+      controller.abort();
+    } else {
+      const controllers = invocationRequests.get(invocationId) ?? new Set<AbortController>();
+      controllers.add(controller);
+      invocationRequests.set(invocationId, controllers);
+    }
   }
 
   return () => {
@@ -106,6 +111,7 @@ function registerController(controller: AbortController): () => void {
 }
 
 function cancelInvocation(requestId: string): void {
+  cancelledInvocations.add(requestId);
   const controllers = invocationRequests.get(requestId);
   if (!controllers) return;
   for (const controller of controllers) controller.abort();
@@ -148,9 +154,9 @@ function lxRequest(
 ): () => void {
   const controller = new AbortController();
   const unregister = registerController(controller);
-  const timeout = typeof options.timeout === 'number' && options.timeout > 0
-    ? Math.min(options.timeout, 60_000)
-    : 60_000;
+  // 管理器統一將單次音源 HTTP 請求限制為 10 秒；不採用音源腳本自行設定的 5 秒短逾時，
+  // 也不允許腳本把單次請求延長到超過管理器的等待上限。
+  const timeout = 10_000;
   const headers = { ...(options.headers ?? {}) };
   let data: unknown = options.body;
 
@@ -335,6 +341,9 @@ port.on('message', (message: ParentMessage) => {
       }).catch((error: unknown) => {
         const messageText = error instanceof Error ? error.message : String(error);
         port.postMessage({ type: 'result', requestId: message.requestId, error: messageText });
+      }).finally(() => {
+        cancelledInvocations.delete(message.requestId);
+        invocationRequests.delete(message.requestId);
       });
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
