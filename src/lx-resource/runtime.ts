@@ -1,251 +1,542 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
-import {
-  LX_QUALITIES,
-  type LxLogLevel,
-  type LxPlatformCapability,
-  type LxRuntimeExit,
-  type LxScriptInfo,
-  type LxSourceCapabilities,
-  type LxWorkerInitialization,
-  type LxWorkerInvocation
+
+import type {
+  LxLogLevel,
+  LxScriptInfo,
+  LxWorkerInvocation,
+  LxQuality
 } from './types';
+
+type PendingInvocation = {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  abortHandler?: () => void;
+};
 
 type RuntimeOptions = {
   script: string;
   sourceInfo: LxScriptInfo;
   initializationTimeoutMs?: number;
   onLog?: (level: LxLogLevel, message: string) => void;
-  onExit?: (event: LxRuntimeExit) => void;
+  onExit?: (event: { code: number; expected: boolean }) => void;
 };
 
-type PendingInvocation = {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-  timer: NodeJS.Timeout;
+type RuntimeCapability = {
+  type: string;
+  actions: string[];
+  qualitys: LxQuality[];
 };
 
-function normalizeCapability(value: unknown): LxPlatformCapability | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const source = value as { type?: unknown; actions?: unknown; qualitys?: unknown };
-  if (source.type !== 'music' || !Array.isArray(source.actions) || !source.actions.includes('musicUrl')) {
+type RuntimeInitialization = {
+  sourceInfo: LxScriptInfo;
+  capabilities: {
+    tx?: RuntimeCapability;
+    wy?: RuntimeCapability;
+  };
+};
+
+type WorkerMessage = {
+  type: string;
+  requestId?: string;
+  level?: LxLogLevel;
+  message?: string;
+  data?: unknown;
+  value?: unknown;
+  error?: string;
+  hasRequestHandler?: boolean;
+};
+
+const DEFAULT_INITIALIZATION_TIMEOUT_MS = 10_000;
+const DEFAULT_INVOCATION_TIMEOUT_MS = 5_000;
+
+const LX_QUALITIES: LxQuality[] = [
+  '128k',
+  '320k',
+  'flac',
+  'flac24bit',
+  'hires',
+  'atmos',
+  'master'
+];
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function normalizeCapability(value: unknown): RuntimeCapability | undefined {
+  if (!isRecord(value)) return undefined;
+
+  if (value.type !== 'music') return undefined;
+
+  if (!Array.isArray(value.actions) || !value.actions.includes('musicUrl')) {
     return undefined;
   }
-  if (!Array.isArray(source.qualitys)) return undefined;
-  const rawQualities = source.qualitys;
-  const qualities = LX_QUALITIES.filter((quality) => rawQualities.includes(quality));
-  if (qualities.length === 0) return undefined;
+
+  if (!Array.isArray(value.qualitys)) return undefined;
+
+  const qualitys = value.qualitys.filter(
+    (quality: unknown): quality is LxQuality =>
+      typeof quality === 'string' &&
+      LX_QUALITIES.includes(quality as LxQuality)
+  );
+
+  if (qualitys.length === 0) return undefined;
+
   return {
-    actions: source.actions.filter((action): action is string => typeof action === 'string'),
-    qualities
+    type: value.type,
+    actions: value.actions.filter(
+      (action: unknown): action is string => typeof action === 'string'
+    ),
+    qualitys: [...new Set(qualitys)]
   };
 }
 
 function normalizeInitialization(
-  raw: unknown,
-  hasRequestHandler: boolean,
-  sourceInfo: LxScriptInfo
-): LxWorkerInitialization {
-  if (!hasRequestHandler) throw new Error('LX source did not register a request handler');
-  if (!raw || typeof raw !== 'object') throw new Error('LX source inited payload is invalid');
-  const info = raw as { status?: unknown; sources?: unknown };
-  if (info.status === false) throw new Error('LX source reported initialization failure');
-  if (!info.sources || typeof info.sources !== 'object') {
-    throw new Error('LX source did not declare sources');
+  data: unknown,
+  sourceInfo: LxScriptInfo,
+  hasRequestHandler: boolean
+): RuntimeInitialization {
+  if (!hasRequestHandler) {
+    throw new Error('LX source has not registered a request handler');
   }
 
-  const sources = info.sources as Record<string, unknown>;
-  const capabilities: LxSourceCapabilities = {
-    tx: normalizeCapability(sources.tx),
-    wy: normalizeCapability(sources.wy)
-  };
-  if (!capabilities.tx && !capabilities.wy) {
-    throw new Error('LX source has no usable tx or wy capability');
+  if (!isRecord(data)) {
+    throw new Error('Invalid LX initialization response');
   }
-  const fallbackName = [sources.tx, sources.wy]
-    .map((source) => source && typeof source === 'object'
-      ? (source as { name?: unknown }).name
-      : undefined)
-    .find((name): name is string => typeof name === 'string' && Boolean(name.trim()));
-  const resolvedSourceInfo = {
-    ...sourceInfo,
-    name: sourceInfo.name || fallbackName?.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 64) || ''
+
+  if (data.status === false) {
+    throw new Error(
+      typeof data.message === 'string'
+        ? data.message
+        : 'LX source initialization failed'
+    );
+  }
+
+  if (!isRecord(data.sources)) {
+    throw new Error('LX source initialization did not provide sources');
+  }
+
+  const tx = normalizeCapability(data.sources.tx);
+  const wy = normalizeCapability(data.sources.wy);
+
+  if (!tx && !wy) {
+    throw new Error('LX source does not support musicUrl');
+  }
+
+  return {
+    sourceInfo: {
+      ...sourceInfo,
+      ...(isRecord(data.sourceInfo) ? data.sourceInfo : {})
+    },
+    capabilities: {
+      ...(tx ? { tx } : {}),
+      ...(wy ? { wy } : {})
+    }
   };
-  return { sourceInfo: resolvedSourceInfo, capabilities };
+}
+
+function createAbortError(): Error {
+  const error = new Error('LX source invocation cancelled');
+  error.name = 'AbortError';
+  return error;
 }
 
 export class LxSourceRuntime {
   private readonly worker: Worker;
+
   private readonly pending = new Map<string, PendingInvocation>();
+
   private readonly initializationTimeoutMs: number;
-  private readonly sourceInfo: LxScriptInfo;
+
   private readonly onLog?: RuntimeOptions['onLog'];
+
   private readonly onExit?: RuntimeOptions['onExit'];
-  private initialization?: Promise<LxWorkerInitialization>;
+
+  private readonly sourceInfo: LxScriptInfo;
+
+  private initialization?: Promise<RuntimeInitialization>;
+
+  private initialized = false;
+
   private expectedExit = false;
+
   private stopped = false;
 
+  private exited = false;
+
   constructor(options: RuntimeOptions) {
-    this.initializationTimeoutMs = options.initializationTimeoutMs ?? 10_000;
     this.sourceInfo = options.sourceInfo;
+    this.initializationTimeoutMs =
+      options.initializationTimeoutMs ??
+      DEFAULT_INITIALIZATION_TIMEOUT_MS;
+
     this.onLog = options.onLog;
     this.onExit = options.onExit;
-    this.worker = new Worker(path.join(__dirname, 'worker.js'), {
-      workerData: {
-        script: options.script,
-        sourceInfo: options.sourceInfo
+
+    this.worker = new Worker(
+      path.join(__dirname, 'worker.js'),
+      {
+        workerData: {
+          script: options.script,
+          sourceInfo: options.sourceInfo
+        }
+      }
+    );
+
+    this.worker.on('message', (message: WorkerMessage) => {
+      this.handleMessage(message);
+    });
+
+    this.worker.on('error', (error: Error) => {
+      this.handleWorkerError(error);
+    });
+
+    this.worker.on('exit', (code: number) => {
+      this.handleExit(code);
+    });
+  }
+
+  get isStopped(): boolean {
+    return this.stopped || this.exited;
+  }
+
+  get isInitialized(): boolean {
+    return this.initialized;
+  }
+
+  initialize(): Promise<RuntimeInitialization> {
+    if (this.initialization) {
+      return this.initialization;
+    }
+
+    if (this.stopped || this.exited) {
+      return Promise.reject(
+        new Error('LX source worker has already stopped')
+      );
+    }
+
+    this.initialization = new Promise<RuntimeInitialization>(
+      (resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(
+            new Error(
+              `LX source initialization timeout after ${this.initializationTimeoutMs}ms`
+            )
+          );
+
+          void this.terminate();
+        }, this.initializationTimeoutMs);
+
+        const originalHandleMessage = this.handleMessage.bind(this);
+
+        const initializationHandler = (message: WorkerMessage) => {
+          if (message.type === 'initialized') {
+            clearTimeout(timer);
+
+            try {
+              const result = normalizeInitialization(
+                message.data,
+                this.sourceInfo,
+                message.hasRequestHandler === true
+              );
+
+              this.initialized = true;
+              resolve(result);
+            } catch (error) {
+              reject(
+                error instanceof Error
+                  ? error
+                  : new Error(String(error))
+              );
+
+              void this.terminate();
+            }
+
+            return;
+          }
+
+          if (message.type === 'initializationError') {
+            clearTimeout(timer);
+
+            reject(
+              new Error(
+                message.error || 'LX source initialization failed'
+              )
+            );
+
+            void this.terminate();
+            return;
+          }
+
+          originalHandleMessage(message);
+        };
+
+        const messageListener = (message: WorkerMessage) => {
+          initializationHandler(message);
+        };
+
+        this.worker.on('message', messageListener);
+
+        const cleanup = () => {
+          this.worker.off('message', messageListener);
+          clearTimeout(timer);
+        };
+
+        this.worker.once('exit', () => {
+          cleanup();
+
+          if (!this.initialized) {
+            reject(
+              new Error('LX source worker exited before initialization')
+            );
+          }
+        });
+
+        this.worker.once('error', (error: Error) => {
+          cleanup();
+          reject(error);
+        });
+      }
+    );
+
+    return this.initialization;
+  }
+
+  invoke(
+    invocation: LxWorkerInvocation,
+    signal?: AbortSignal
+  ): Promise<unknown> {
+    if (this.stopped || this.exited) {
+      return Promise.reject(
+        new Error('LX source worker is not available')
+      );
+    }
+
+    if (!this.initialized) {
+      return Promise.reject(
+        new Error('LX source worker has not been initialized')
+      );
+    }
+
+    if (signal?.aborted) {
+      return Promise.reject(createAbortError());
+    }
+
+    const requestId = randomUUID();
+
+    const timeoutMs =
+      typeof invocation.timeoutMs === 'number' &&
+      invocation.timeoutMs > 0
+        ? invocation.timeoutMs
+        : DEFAULT_INVOCATION_TIMEOUT_MS;
+
+    const { timeoutMs: _timeoutMs, ...workerInvocation } = invocation;
+
+    return new Promise<unknown>((resolve, reject) => {
+      const cleanup = (pending: PendingInvocation) => {
+        clearTimeout(pending.timer);
+
+        if (pending.signal && pending.abortHandler) {
+          pending.signal.removeEventListener(
+            'abort',
+            pending.abortHandler
+          );
+        }
+      };
+
+      const cancel = (error: Error) => {
+        const pending = this.pending.get(requestId);
+        if (!pending) return;
+
+        this.pending.delete(requestId);
+        cleanup(pending);
+
+        try {
+          this.worker.postMessage({
+            type: 'cancel',
+            requestId
+          });
+        } catch {
+          // Worker may already have exited.
+        }
+
+        reject(error);
+      };
+
+      const timer = setTimeout(() => {
+        cancel(
+          new Error(`LX source request timeout after ${timeoutMs}ms`)
+        );
+      }, timeoutMs);
+
+      const pending: PendingInvocation = {
+        resolve,
+        reject,
+        timer,
+        signal
+      };
+
+      if (signal) {
+        pending.abortHandler = () => {
+          cancel(createAbortError());
+        };
+
+        signal.addEventListener(
+          'abort',
+          pending.abortHandler,
+          { once: true }
+        );
+      }
+
+      this.pending.set(requestId, pending);
+
+      try {
+        this.worker.postMessage({
+          type: 'invoke',
+          requestId,
+          invocation: workerInvocation
+        });
+      } catch (error) {
+        this.pending.delete(requestId);
+        cleanup(pending);
+
+        reject(
+          error instanceof Error
+            ? error
+            : new Error(String(error))
+        );
       }
     });
   }
 
-  initialize(): Promise<LxWorkerInitialization> {
-    if (this.initialization) return this.initialization;
-    this.initialization = new Promise<LxWorkerInitialization>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`LX source initialization timed out after ${this.initializationTimeoutMs}ms`));
-        void this.terminate();
-      }, this.initializationTimeoutMs);
-      timer.unref?.();
+  async drainAndTerminate(): Promise<void> {
+    if (this.stopped || this.exited) return;
 
-      const onMessage = (message: any) => {
-        if (message?.type === 'initializationError') {
-          clearTimeout(timer);
-          cleanup();
-          reject(new Error(String(message.error || 'LX source initialization failed')));
-          void this.terminate();
-          return;
-        }
-        if (message?.type !== 'initialized') return;
-        clearTimeout(timer);
-        cleanup();
-        try {
-          resolve(normalizeInitialization(message.data, message.hasRequestHandler === true, this.sourceInfo));
-        } catch (error) {
-          reject(error);
-          void this.terminate();
-        }
-      };
-      const onError = (error: Error) => {
-        clearTimeout(timer);
-        cleanup();
-        reject(error);
-      };
-      const onExit = (code: number) => {
-        clearTimeout(timer);
-        cleanup();
-        reject(new Error(`LX source worker exited during initialization with code ${code}`));
-      };
-      const cleanup = () => {
-        this.worker.off('message', onMessage);
-        this.worker.off('error', onError);
-        this.worker.off('exit', onExit);
-      };
+    this.expectedExit = true;
 
-      this.worker.on('message', onMessage);
-      this.worker.once('error', onError);
-      this.worker.once('exit', onExit);
-    });
+    const drainTimeoutMs = 5_000;
+    const start = Date.now();
 
-    this.worker.on('message', (message: any) => this.handleMessage(message));
-    this.worker.on('error', (error) => this.handleExit({ expected: this.expectedExit, error }));
-    this.worker.on('exit', (code) => {
-      const error = code === 0 ? undefined : new Error(`LX source worker exited with code ${code}`);
-      this.handleExit({ expected: this.expectedExit, error });
-    });
-    return this.initialization;
-  }
-
-  invoke(invocation: LxWorkerInvocation): Promise<unknown> {
-    if (this.stopped) return Promise.reject(new Error('LX source worker is unavailable'));
-    const requestId = randomUUID();
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(requestId);
-        this.worker.postMessage({ type: 'cancel', requestId });
-        reject(new Error(`LX source request timed out after ${invocation.timeoutMs}ms`));
-      }, invocation.timeoutMs);
-      timer.unref?.();
-
-      this.pending.set(requestId, { resolve, reject, timer });
-      this.worker.postMessage({
-        type: 'invoke',
-        requestId,
-        invocation: {
-          source: invocation.source,
-          quality: invocation.quality,
-          musicInfo: invocation.musicInfo
-        }
+    while (
+      this.pending.size > 0 &&
+      Date.now() - start < drainTimeoutMs
+    ) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 50);
       });
-    });
-  }
-
-  async drainAndTerminate(timeoutMs: number = 3_000): Promise<void> {
-    if (this.pending.size === 0) {
-      await this.terminate();
-      return;
     }
 
-    await new Promise<void>((resolve) => {
-      let poll: NodeJS.Timeout;
-      const finish = () => {
-        clearInterval(poll);
-        resolve();
-      };
-      const deadline = setTimeout(finish, timeoutMs);
-      deadline.unref?.();
-      poll = setInterval(() => {
-        if (this.pending.size !== 0) return;
-        clearTimeout(deadline);
-        finish();
-      }, 25);
-      poll.unref?.();
-    });
     await this.terminate();
   }
 
   async terminate(): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || this.exited) return;
+
     this.stopped = true;
     this.expectedExit = true;
+
     try {
       this.worker.postMessage({ type: 'stop' });
     } catch {
-      // Worker may already be gone.
+      // Worker may already have exited.
     }
-    await this.worker.terminate();
-    this.rejectPending(new Error('LX source worker stopped'));
+
+    this.rejectPending(
+      new Error('LX source worker has been terminated')
+    );
+
+    try {
+      await this.worker.terminate();
+    } catch {
+      // Ignore termination errors.
+    }
   }
 
-  private handleMessage(message: any): void {
-    if (message?.type === 'log') {
-      this.onLog?.(message.level, String(message.message ?? ''));
+  private handleMessage(message: WorkerMessage): void {
+    if (!message || typeof message !== 'object') return;
+
+    if (message.type === 'log') {
+      this.onLog?.(
+        message.level ?? 'info',
+        message.message ?? ''
+      );
       return;
     }
-    if (message?.type !== 'result' || typeof message.requestId !== 'string') return;
+
+    if (
+      message.type === 'initialized' ||
+      message.type === 'initializationError'
+    ) {
+      return;
+    }
+
+    if (message.type !== 'result' || !message.requestId) {
+      return;
+    }
+
     const pending = this.pending.get(message.requestId);
     if (!pending) return;
+
     this.pending.delete(message.requestId);
+
     clearTimeout(pending.timer);
+
+    if (pending.signal && pending.abortHandler) {
+      pending.signal.removeEventListener(
+        'abort',
+        pending.abortHandler
+      );
+    }
+
     if (message.error) {
-      pending.reject(new Error(String(message.error)));
+      pending.reject(new Error(message.error));
     } else {
       pending.resolve(message.value);
     }
   }
 
-  private handleExit(event: LxRuntimeExit): void {
-    if (this.stopped && event.expected) return;
+  private handleWorkerError(error: Error): void {
+    this.rejectPending(error);
+
+    if (!this.initialized) {
+      this.initialization = Promise.reject(error);
+      void this.initialization.catch(() => undefined);
+    }
+  }
+
+  private handleExit(code: number): void {
+    if (this.exited) return;
+
+    this.exited = true;
     this.stopped = true;
-    this.rejectPending(event.error ?? new Error('LX source worker exited'));
-    this.onExit?.(event);
+
+    this.rejectPending(
+      new Error(`LX source worker exited with code ${code}`)
+    );
+
+    this.onExit?.({
+      code,
+      expected: this.expectedExit
+    });
   }
 
   private rejectPending(error: Error): void {
-    for (const pending of this.pending.values()) {
+    for (const [requestId, pending] of this.pending) {
       clearTimeout(pending.timer);
+
+      if (pending.signal && pending.abortHandler) {
+        pending.signal.removeEventListener(
+          'abort',
+          pending.abortHandler
+        );
+      }
+
       pending.reject(error);
+      this.pending.delete(requestId);
     }
-    this.pending.clear();
   }
 }
