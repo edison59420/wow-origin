@@ -8,14 +8,13 @@ import {
   getLxSourceCacheDirectory,
   getLxSourceCachePath,
   createLxSourceConfigs,
-  getLxQualityCandidates,
   mapLxQualityToTrackUrl,
   mapMusicPlatformToLx,
   parseLxScriptInfo,
   sourceLabel
 } from './config';
 import { LxSourceRuntime } from './runtime';
-import { getExactLxQuality } from './quality';
+import { getLxQualityPriority } from './quality';
 import type {
   LxLogLevel,
   LxSourceCapabilities,
@@ -142,36 +141,62 @@ export class LxSourceManager implements LxTrackUrlResolver, LxSourceLifecycle {
     createLxSourceConfigs(accountSources).forEach((config) => selectedConfigs.set(config.hash, config));
     this.globalConfigs.forEach((config) => selectedConfigs.set(config.hash, config));
 
-    for (const config of selectedConfigs.values()) {
+    // 账号专属源仍优先；总计最多三条有效线路，缺少账号源时再由全局源补足。
+    const activeSources = [...selectedConfigs.values()]
+      .map((config) => ({ config, source: this.sources.get(config.hash) }))
+      .filter((item): item is { config: LxSourceConfig; source: RegisteredSource } => (
+        Boolean(item.source?.capabilities[lxPlatform])
+      ))
+      .slice(0, 3);
+    if (activeSources.length === 0) return undefined;
+
+    const availableQualities = [...new Set(activeSources.flatMap(({ source }) => (
+      source.capabilities[lxPlatform]?.qualities ?? []
+    )))];
+    const qualityCandidates = getLxQualityPriority(
+      platform,
+      quality,
+      availableQualities,
+      options.allowFallback !== false
+    );
+
+    // 每個音質檔位三線同時請求；先按音質分層，再由 Promise.any 選最快成功的完整 URL。
+    for (const lxQuality of qualityCandidates) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      const source = this.sources.get(config.hash);
-      const capability = source?.capabilities[lxPlatform];
-      if (!source || !capability) continue;
-      const exactQuality = getExactLxQuality(platform, quality, capability.qualities);
-      const candidates = options.allowFallback === false
-        ? (exactQuality ? [exactQuality] : [])
-        : getLxQualityCandidates(quality, capability.qualities, platform);
-      for (const lxQuality of candidates) {
-        const candidateRemaining = deadline - Date.now();
-        if (candidateRemaining <= 0) break;
-        try {
-          const result = await source.runtime.invoke({
+      const eligible = activeSources.filter(({ source }) => (
+        source.capabilities[lxPlatform]?.qualities.includes(lxQuality)
+      ));
+      if (eligible.length === 0) continue;
+
+      const attempts = eligible.map(({ config, source }) => {
+        const startedAt = Date.now();
+        return source.runtime.invoke({
+          source: lxPlatform,
+          quality: lxQuality,
+          timeoutMs: Math.min(SOURCE_REQUEST_TIMEOUT_MS, remaining),
+          musicInfo: {
+            id,
+            songmid: id,
+            ...(lxPlatform === 'tx' ? { strMediaMid: id } : {}),
             source: lxPlatform,
-            quality: lxQuality,
-            timeoutMs: Math.min(SOURCE_REQUEST_TIMEOUT_MS, candidateRemaining),
-            musicInfo: {
-              id,
-              songmid: id,
-              ...(lxPlatform === 'tx' ? { strMediaMid: id } : {}),
-              source: lxPlatform,
-              types: capability.qualities.map((type) => ({ type, size: null }))
-            }
-          });
-          return mapLxQualityToTrackUrl(validateAudioUrl(result), lxQuality);
-        } catch (error) {
-          this.log('warn', source.name, config.hash, `获取音频失败: ${safeErrorMessage(error)}`);
-        }
+            types: source.capabilities[lxPlatform]!.qualities.map((type) => ({ type, size: null }))
+          }
+        }).then((result) => {
+          const audioUrl = validateAudioUrl(result);
+          const elapsed = Date.now() - startedAt;
+          this.log('info', source.name, config.hash, `三線並發命中 ${lxQuality}，耗时 ${elapsed}ms`);
+          return mapLxQualityToTrackUrl(audioUrl, lxQuality);
+        }).catch((error: unknown) => {
+          this.log('warn', source.name, config.hash, `並發取得 ${lxQuality} 失败: ${safeErrorMessage(error)}`);
+          throw error;
+        });
+      });
+
+      try {
+        return await Promise.any(attempts);
+      } catch {
+        // 三条线路在该档位都失败，再进入下一音质档位。
       }
     }
     return undefined;
