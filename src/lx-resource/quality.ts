@@ -1,24 +1,43 @@
 import type { MusicPlatform } from '../types';
 import type { LxQuality } from './types';
 
-/** 只映射相同档位；源不支持时由外层根据歌曲音质表决定降级。 */
-export function getExactLxQuality(platform: MusicPlatform, quality: string | undefined, supported: readonly LxQuality[]): LxQuality | undefined {
+/**
+ * 將 Aduoer App 傳入的音質名稱映射到 Luoxue 音源檔位。
+ * 只映射同一檔位，不把 lossless/master/hires 混為同一音質。
+ */
+export function getExactLxQuality(
+  platform: MusicPlatform,
+  quality: string | undefined,
+  supported: readonly LxQuality[]
+): LxQuality | undefined {
   const mapping: Record<string, LxQuality> = {
     standard: '128k',
     higher: '320k',
     exhigh: '320k',
     lossless: 'flac',
+    flac: 'flac',
+    flac24bit: 'flac24bit',
+    '320k': '320k',
+    '128k': '128k',
     master: 'master',
-    ...(platform === 'netease' ? { hires: 'hires' as const, sky: 'atmos' as const } : {})
+    ...(platform === 'netease'
+      ? { hires: 'hires' as const, sky: 'atmos' as const, atmos: 'atmos' as const }
+      : {})
   };
-  const mapped = quality ? mapping[quality] : undefined;
+
+  const selected = quality?.trim().toLowerCase();
+  const mapped = selected ? mapping[selected] : undefined;
   return mapped && supported.includes(mapped) ? mapped : undefined;
 }
 
-
 /**
- * 音源候选排序：先尝试所有已配置音源都支持的最高档，再逐级降档。
- * allowFallback=false 表示不低于调用方要求的档位，但仍允许向上取更高音质。
+ * 音質候選排序：
+ * 以 App 指定檔位為第一順位，只在該檔位失敗後向下 fallback。
+ *
+ * max 明確要求最高音質；
+ * min 明確要求目前可用的最低音質。
+ *
+ * allowFallback=false 時只嘗試 App 指定的精確檔位。
  */
 export function getLxQualityPriority(
   platform: MusicPlatform,
@@ -29,27 +48,45 @@ export function getLxQualityPriority(
   const order: readonly LxQuality[] = platform === 'qq'
     ? ['master', 'flac24bit', 'flac', '320k', '128k']
     : ['master', 'atmos', 'hires', 'flac24bit', 'flac', '320k', '128k'];
+
   const requestedMap: Record<string, LxQuality> = {
     standard: '128k',
     higher: '320k',
     exhigh: '320k',
     lossless: 'flac',
+    flac: 'flac',
+    flac24bit: 'flac24bit',
+    '320k': '320k',
+    '128k': '128k',
     master: 'master',
-    ...(platform === 'netease' ? { hires: 'hires' as const, sky: 'atmos' as const } : {})
+    ...(platform === 'netease'
+      ? { hires: 'hires' as const, sky: 'atmos' as const, atmos: 'atmos' as const }
+      : {})
   };
-  const selected = requestedQuality || 'exhigh';
-  if (selected === 'jyeffect') return [];
-  let candidates: readonly LxQuality[] = order;
 
-  if (!allowFallback && selected !== 'max') {
-    if (selected === 'min') {
-      candidates = order.slice(-1);
-    } else {
-      const requested = requestedMap[selected] || '320k';
-      const requestedIndex = order.indexOf(requested);
-      candidates = order.slice(0, requestedIndex + 1);
-    }
+  const selected = requestedQuality?.trim().toLowerCase() || 'exhigh';
+
+  if (selected === 'jyeffect') return [];
+
+  if (selected === 'min') {
+    const minimum = [...order].reverse().find((item) => available.includes(item));
+    return minimum ? [minimum] : [];
   }
 
-  return candidates.filter((quality) => available.includes(quality));
+  if (selected === 'max') {
+    const candidates = order.filter((item) => available.includes(item));
+    return allowFallback ? candidates : candidates.slice(0, 1);
+  }
+
+  const requested = requestedMap[selected] || '320k';
+  const requestedIndex = order.indexOf(requested);
+
+  if (requestedIndex < 0) return [];
+
+  if (!allowFallback) {
+    return available.includes(requested) ? [requested] : [];
+  }
+
+  // 從 App 指定音質開始往低檔嘗試，不先查詢更高檔位。
+  return order.slice(requestedIndex).filter((item) => available.includes(item));
 }
