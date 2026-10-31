@@ -1,109 +1,93 @@
 
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import axios, { type AxiosError } from 'axios';
+import axios from 'axios';
 import type { RawMusicAccount } from '../accounts';
 import type { AccountStore } from './accounts';
 
-type ReplaceableAccountStore = AccountStore & {
+type BackupStore = AccountStore & {
   replaceAll?: (accounts: RawMusicAccount[]) => void;
   setChangeListener?: (listener?: () => void) => void;
 };
 
-type BackupPayload = {
-  format: 'wow-origin-account-backup';
-  version: 1;
-  updatedAt: string;
-  accounts: RawMusicAccount[];
-};
+type BackupMode = 'encrypted-scrypt' | 'encrypted-pbkdf2' | 'plaintext';
 
-type RemoteBackup = {
-  accounts: RawMusicAccount[];
+type RemoteFile = {
+  path: string;
   sha: string;
-  encrypted: boolean;
-  encryptedWithCurrentKey: boolean;
+  accounts: RawMusicAccount[];
+  mode: BackupMode;
 };
 
-type GitHubAccountBackupOptions = {
-  store: ReplaceableAccountStore;
-  repo: string;
-  token: string;
-  encryptionKey: string;
-  previousEncryptionKeys?: string[];
-  branch?: string;
-  filePath?: string;
-  legacyFilePath?: string;
-  intervalMs?: number;
-};
-
+const ENC_PATH = 'accounts/accounts.enc';
+const JSON_PATH = 'accounts/accounts.json';
 const AAD = Buffer.from('wow-origin-account-backup:v1');
-const KDF_SALT = 'wow-origin-account-backup-v1';
-const DEFAULT_FILE_PATH = 'accounts/accounts.enc';
-const DEFAULT_LEGACY_FILE_PATH = 'accounts/data.db.b64';
-const DEFAULT_INTERVAL_MS = 5000;
-
-function digest(value: string): string {
-  return crypto.createHash('sha256').update(value).digest('hex');
-}
-
-function serializeAccounts(accounts: RawMusicAccount[]): string {
-  return JSON.stringify(accounts) ?? '[]';
-}
 
 function validateAccounts(value: unknown): RawMusicAccount[] {
   if (!Array.isArray(value)) {
-    throw new Error('GitHub 帳號備份格式錯誤：accounts 必須是陣列');
+    throw new Error('帳號備份格式錯誤：accounts 必須是陣列');
   }
 
+  const result: RawMusicAccount[] = [];
   const seen = new Set<string>();
 
-  return value.filter((item): item is RawMusicAccount => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) {
-      return false;
-    }
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
 
-    const key = String(
-      (item as RawMusicAccount).api_access_key || ''
-    ).trim();
+    const account = item as RawMusicAccount;
+    const key = String(account.api_access_key || '').trim();
 
-    if (!key || seen.has(key)) return false;
+    if (!key || seen.has(key)) continue;
 
     seen.add(key);
-    return true;
-  });
+
+    result.push({
+      platform: account.platform,
+      name: account.name,
+      cookie: account.cookie,
+      api_access_key: key,
+      stateless: account.stateless,
+      useLuoxue: account.useLuoxue,
+      lxSource: account.lxSource,
+      deviceId: account.deviceId,
+      deviceState: account.deviceState
+    });
+  }
+
+  return result;
 }
 
-function mergeAccounts(
-  remote: RawMusicAccount[],
-  local: RawMusicAccount[]
-): RawMusicAccount[] {
-  const merged = new Map<string, RawMusicAccount>();
+function parsePlaintext(text: string): RawMusicAccount[] {
+  const parsed = JSON.parse(text);
 
-  remote.forEach((account) => {
-    merged.set(String(account.api_access_key), account);
-  });
+  if (Array.isArray(parsed)) {
+    return validateAccounts(parsed);
+  }
 
-  // 本機同 key 帳號優先，同時保留遠端缺少的帳號。
-  local.forEach((account) => {
-    merged.set(String(account.api_access_key), account);
-  });
+  if (parsed && Array.isArray(parsed.accounts)) {
+    return validateAccounts(parsed.accounts);
+  }
 
-  return [...merged.values()];
+  throw new Error('accounts.json 格式錯誤');
 }
 
-function encryptPayload(
-  payload: BackupPayload,
-  key: Buffer
-): string {
+function deriveScrypt(key: string): Buffer {
+  return crypto.scryptSync(key, 'wow-origin-account-backup-v1', 32);
+}
+
+function encryptScrypt(accounts: RawMusicAccount[], password: string): string {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', deriveScrypt(password), iv);
 
   cipher.setAAD(AAD);
 
-  const ciphertext = Buffer.concat([
+  const payload = {
+    format: 'wow-origin-account-backup',
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    accounts
+  };
+
+  const encrypted = Buffer.concat([
     cipher.update(JSON.stringify(payload), 'utf8'),
     cipher.final()
   ]);
@@ -113,576 +97,303 @@ function encryptPayload(
     version: 1,
     iv: iv.toString('base64'),
     tag: cipher.getAuthTag().toString('base64'),
-    ciphertext: ciphertext.toString('base64')
-  });
+    ciphertext: encrypted.toString('base64')
+  }, null, 2);
 }
 
-/**
- * 相容目前格式與舊版 accounts.enc。
- *
- * 目前格式：
- * {
- *   format: "wow-origin-encrypted-backup",
- *   version: 1,
- *   iv,
- *   tag,
- *   ciphertext
- * }
- *
- * 舊版格式：
- * {
- *   version: 1,
- *   algorithm: "aes-256-gcm",
- *   iv,
- *   tag,
- *   ciphertext
- * }
- *
- * 舊版可能沒有 format 欄位，也可能沒有使用 AAD。
- */
-function decryptPayload(
-  envelopeText: string,
-  keys: Buffer[]
-): {
-  payload: BackupPayload;
-  keyIndex: number;
-  canonical: boolean;
-} {
-  let envelope: any;
-
-  try {
-    envelope = JSON.parse(envelopeText);
-  } catch (error) {
-    throw new Error(
-      'GitHub 帳號備份不是有效的加密 JSON',
-      { cause: error }
-    );
-  }
-
-  const validFormat =
-    !envelope?.format ||
-    envelope.format === 'wow-origin-encrypted-backup';
-
-  const validAlgorithm =
-    !envelope?.algorithm ||
-    envelope.algorithm === 'aes-256-gcm';
+function decryptScrypt(text: string, password: string): RawMusicAccount[] {
+  const envelope = JSON.parse(text);
 
   if (
-    envelope?.version !== 1 ||
-    !validFormat ||
-    !validAlgorithm ||
-    typeof envelope?.iv !== 'string' ||
-    typeof envelope?.tag !== 'string' ||
-    typeof envelope?.ciphertext !== 'string'
+    envelope?.format !== 'wow-origin-encrypted-backup' ||
+    envelope?.version !== 1
   ) {
-    throw new Error('GitHub 帳號備份版本或格式不受支援');
+    throw new Error('不支援的 Scrypt 備份格式');
   }
 
+  const decipher = crypto.createDecipheriv(
+    'aes-256-gcm',
+    deriveScrypt(password),
+    Buffer.from(envelope.iv, 'base64')
+  );
+
+  decipher.setAAD(AAD);
+  decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
+
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(envelope.ciphertext, 'base64')),
+    decipher.final()
+  ]).toString('utf8');
+
+  const payload = JSON.parse(decrypted);
+
+  if (
+    payload?.format !== 'wow-origin-account-backup' ||
+    payload?.version !== 1
+  ) {
+    throw new Error('Scrypt 備份內容格式錯誤');
+  }
+
+  return validateAccounts(payload.accounts);
+}
+
+function derivePbkdf2(password: string, salt: Buffer, iterations: number): Buffer {
+  return crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+}
+
+function encryptPbkdf2(accounts: RawMusicAccount[], password: string): string {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const iterations = 210000;
+
+  const key = derivePbkdf2(password, salt, iterations);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+
+  const payload = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    accounts
+  };
+
+  const encrypted = Buffer.concat([
+    cipher.update(JSON.stringify(payload), 'utf8'),
+    cipher.final()
+  ]);
+
+  return JSON.stringify({
+    version: 2,
+    algorithm: 'aes-256-gcm',
+    kdf: 'pbkdf2-sha256',
+    iterations,
+    salt: salt.toString('base64'),
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    data: encrypted.toString('base64')
+  }, null, 2);
+}
+
+function decryptPbkdf2(text: string, password: string): RawMusicAccount[] {
+  const envelope = JSON.parse(text);
+
+  if (
+    envelope?.version !== 2 ||
+    envelope?.algorithm !== 'aes-256-gcm' ||
+    envelope?.kdf !== 'pbkdf2-sha256'
+  ) {
+    throw new Error('不支援的 PBKDF2 備份格式');
+  }
+
+  const iterations = Number(envelope.iterations);
+
+  if (!Number.isInteger(iterations) || iterations < 10000 || iterations > 1000000) {
+    throw new Error('PBKDF2 迭代次數無效');
+  }
+
+  const salt = Buffer.from(envelope.salt, 'base64');
   const iv = Buffer.from(envelope.iv, 'base64');
   const tag = Buffer.from(envelope.tag, 'base64');
-  const ciphertext = Buffer.from(envelope.ciphertext, 'base64');
+  const data = Buffer.from(envelope.data, 'base64');
 
-  if (
-    iv.length !== 12 ||
-    tag.length !== 16 ||
-    ciphertext.length === 0
-  ) {
-    throw new Error('GitHub 帳號備份加密欄位長度錯誤');
+  if (salt.length < 8 || iv.length !== 12 || tag.length !== 16 || !data.length) {
+    throw new Error('PBKDF2 備份資料不完整');
   }
 
-  for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
-    // 先嘗試目前使用的 AAD 格式，再嘗試舊版無 AAD 格式。
-    for (const useAad of [true, false]) {
-      try {
-        const decipher = crypto.createDecipheriv(
-          'aes-256-gcm',
-          keys[keyIndex],
-          iv
-        );
+  const key = derivePbkdf2(password, salt, iterations);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
 
-        if (useAad) {
-          decipher.setAAD(AAD);
-        }
+  decipher.setAuthTag(tag);
 
-        decipher.setAuthTag(tag);
+  const decrypted = Buffer.concat([
+    decipher.update(data),
+    decipher.final()
+  ]).toString('utf8');
 
-        const plaintext = Buffer.concat([
-          decipher.update(ciphertext),
-          decipher.final()
-        ]).toString('utf8');
-
-        const decoded = JSON.parse(plaintext);
-
-        const accountsValue = Array.isArray(decoded)
-          ? decoded
-          : decoded?.accounts;
-
-        if (
-          decoded &&
-          !Array.isArray(decoded) &&
-          (
-            (decoded.format &&
-              decoded.format !== 'wow-origin-account-backup') ||
-            (
-              decoded.version !== undefined &&
-              decoded.version !== 1
-            )
-          )
-        ) {
-          throw new Error('備份資料版本不受支援');
-        }
-
-        const accounts = validateAccounts(accountsValue);
-
-        const payload: BackupPayload = {
-          format: 'wow-origin-account-backup',
-          version: 1,
-          updatedAt:
-            typeof decoded?.updatedAt === 'string'
-              ? decoded.updatedAt
-              : new Date(0).toISOString(),
-          accounts
-        };
-
-        return {
-          payload,
-          keyIndex,
-          canonical:
-            envelope.format === 'wow-origin-encrypted-backup' &&
-            useAad
-        };
-      } catch {
-        // 不輸出密鑰或解密內容，繼續嘗試其他相容方式。
-      }
-    }
-  }
-
-  throw new Error(
-    'GitHub 帳號備份解密失敗；請確認 ACCOUNT_SYNC_KEY 或舊備份密鑰'
-  );
+  return parsePlaintext(decrypted);
 }
 
-function statusOf(error: unknown): number | undefined {
-  return (error as AxiosError | undefined)?.response?.status;
-}
+function decodeEncrypted(
+  text: string,
+  password: string
+): { accounts: RawMusicAccount[]; mode: BackupMode } {
+  const parsed = JSON.parse(text);
 
-function decodeStoredField(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
-}
-
-function accountsFromLegacySqlite(
-  databaseBytes: Buffer
-): RawMusicAccount[] {
-  if (
-    !databaseBytes
-      .subarray(0, 16)
-      .equals(Buffer.from('SQLite format 3\0'))
-  ) {
-    throw new Error('Not a SQLite database');
-  }
-
-  const temporaryDirectory = fs.mkdtempSync(
-    path.join(os.tmpdir(), 'wow-origin-account-restore-')
-  );
-
-  const filename = path.join(temporaryDirectory, 'legacy.db');
-
-  let database: DatabaseSync | undefined;
-
-  try {
-    fs.writeFileSync(filename, databaseBytes);
-
-    database = new DatabaseSync(filename);
-
-    const columns = (
-      database.prepare('PRAGMA table_info(accounts)').all() as
-        Array<{ name: string }>
-    ).map((column) => column.name);
-
-    if (!columns.length || !columns.includes('api_access_key')) {
-      throw new Error('SQLite backup has no accounts table');
-    }
-
-    const optional = (name: string, alias = name) =>
-      columns.includes(name)
-        ? `${name} AS ${alias}`
-        : `NULL AS ${alias}`;
-
-    const sql = `SELECT ${[
-      optional('platform'),
-      optional('name'),
-      optional('cookie'),
-      optional('api_access_key'),
-      optional('stateless'),
-      optional('use_luoxue'),
-      optional('lx_source'),
-      optional('deviceId', 'device_id'),
-      optional('device_state')
-    ].join(', ')} FROM accounts ORDER BY id ASC`;
-
-    const rows = database
-      .prepare(sql)
-      .all() as Array<Record<string, unknown>>;
-
-    return validateAccounts(
-      rows.map((row) => ({
-        platform: decodeStoredField(row.platform),
-        name: decodeStoredField(row.name),
-        cookie: decodeStoredField(row.cookie),
-        api_access_key: String(row.api_access_key || ''),
-        stateless: decodeStoredField(row.stateless),
-        useLuoxue: decodeStoredField(row.use_luoxue),
-        lxSource: decodeStoredField(row.lx_source),
-        deviceId: decodeStoredField(row.device_id),
-        deviceState: decodeStoredField(row.device_state)
-      }))
-    );
-  } finally {
-    database?.close();
-
-    fs.rmSync(temporaryDirectory, {
-      recursive: true,
-      force: true
-    });
-  }
-}
-
-function decodeRemoteFile(
-  fileBytes: Buffer,
-  keys: Buffer[]
-): {
-  accounts: RawMusicAccount[];
-  encrypted: boolean;
-  encryptedWithCurrentKey: boolean;
-} {
-  const text = fileBytes.toString('utf8').trim();
-
-  if (text.startsWith('{') || text.startsWith('[')) {
-    let parsed: any;
-
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      parsed = undefined;
-    }
-
-    // 重要修正：
-    // 舊版 accounts.enc 沒有 format 欄位，
-    // 但仍然有 version、algorithm、iv、tag、ciphertext。
-    const isEncryptedEnvelope =
-      parsed?.version === 1 &&
-      (
-        parsed?.format === 'wow-origin-encrypted-backup' ||
-        (
-          parsed?.algorithm === 'aes-256-gcm' &&
-          typeof parsed?.iv === 'string' &&
-          typeof parsed?.tag === 'string' &&
-          typeof parsed?.ciphertext === 'string'
-        )
-      );
-
-    if (isEncryptedEnvelope) {
-      const decrypted = decryptPayload(text, keys);
-
-      return {
-        accounts: decrypted.payload.accounts,
-        encrypted: true,
-
-        // 舊版沒有 format 或使用舊式無 AAD，
-        // 必須重新寫成目前標準格式。
-        encryptedWithCurrentKey:
-          decrypted.keyIndex === 0 &&
-          decrypted.canonical
-      };
-    }
-
-    if (Array.isArray(parsed)) {
-      return {
-        accounts: validateAccounts(parsed),
-        encrypted: false,
-        encryptedWithCurrentKey: false
-      };
-    }
-
-    if (Array.isArray(parsed?.accounts)) {
-      return {
-        accounts: validateAccounts(parsed.accounts),
-        encrypted: false,
-        encryptedWithCurrentKey: false
-      };
-    }
-  }
-
-  if (
-    fileBytes
-      .subarray(0, 16)
-      .equals(Buffer.from('SQLite format 3\0'))
-  ) {
+  if (parsed?.format === 'wow-origin-encrypted-backup') {
     return {
-      accounts: accountsFromLegacySqlite(fileBytes),
-      encrypted: false,
-      encryptedWithCurrentKey: false
+      accounts: decryptScrypt(text, password),
+      mode: 'encrypted-scrypt'
     };
   }
 
-  // 舊版本曾將 SQLite 檔案以 base64 文字儲存在
-  // accounts/data.db.b64。
-  try {
-    const decoded = Buffer.from(text, 'base64');
-
-    if (
-      decoded
-        .subarray(0, 16)
-        .equals(Buffer.from('SQLite format 3\0'))
-    ) {
-      return {
-        accounts: accountsFromLegacySqlite(decoded),
-        encrypted: false,
-        encryptedWithCurrentKey: false
-      };
-    }
-
-    const decodedText = decoded.toString('utf8').trim();
-
-    if (
-      decodedText.startsWith('{') ||
-      decodedText.startsWith('[')
-    ) {
-      const parsed = JSON.parse(decodedText);
-
-      if (Array.isArray(parsed)) {
-        return {
-          accounts: validateAccounts(parsed),
-          encrypted: false,
-          encryptedWithCurrentKey: false
-        };
-      }
-
-      if (Array.isArray(parsed?.accounts)) {
-        return {
-          accounts: validateAccounts(parsed.accounts),
-          encrypted: false,
-          encryptedWithCurrentKey: false
-        };
-      }
-    }
-  } catch {
-    // 使用下方明確錯誤訊息。
+  if (
+    parsed?.version === 2 &&
+    parsed?.algorithm === 'aes-256-gcm' &&
+    parsed?.kdf === 'pbkdf2-sha256'
+  ) {
+    return {
+      accounts: decryptPbkdf2(text, password),
+      mode: 'encrypted-pbkdf2'
+    };
   }
 
-  throw new Error(
-    'GitHub 備份格式無法識別；舊資料未被覆蓋'
-  );
+  throw new Error('無法識別 accounts.enc 加密格式');
 }
 
 export class GitHubAccountBackup {
-  private readonly store: ReplaceableAccountStore;
+  private readonly store: BackupStore;
   private readonly repo: string;
   private readonly token: string;
-  private readonly key: Buffer;
-  private readonly readKeys: Buffer[];
+  private readonly password: string;
   private readonly branch: string;
-  private readonly filePath: string;
-  private readonly legacyFilePath: string;
   private readonly intervalMs: number;
-  private readonly apiUrl: string;
 
+  private mode: BackupMode = 'encrypted-scrypt';
+  private targetPath = ENC_PATH;
   private currentSha?: string;
-  private lastDigest = '';
+  private lastSnapshot = '';
   private timer?: NodeJS.Timeout;
   private inFlight?: Promise<void>;
   private initialized = false;
   private stopped = false;
 
-  constructor(options: GitHubAccountBackupOptions) {
-    if (
-      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(
-        options.repo.trim()
-      )
-    ) {
-      throw new Error(
-        'GITHUB_DATA_REPO 格式必須是 owner/repository'
-      );
+  constructor(options: {
+    store: BackupStore;
+    repo: string;
+    token: string;
+    encryptionKey: string;
+    branch?: string;
+    intervalMs?: number;
+  }) {
+    if (!options.store.replaceAll) {
+      throw new Error('AccountStore 不支援 replaceAll');
     }
 
-    if (!options.token.trim()) {
-      throw new Error('GITHUB_TOKEN 不可為空');
+    if (!options.repo || !options.token) {
+      throw new Error('GitHub 備份設定不完整');
     }
 
     if (options.encryptionKey.length < 32) {
-      throw new Error(
-        'ACCOUNT_SYNC_KEY 至少需要 32 個字元，請使用新的隨機長密鑰'
-      );
-    }
-
-    const filePath = (
-      options.filePath || DEFAULT_FILE_PATH
-    ).replace(/^\/+/, '');
-
-    const legacyFilePath = (
-      options.legacyFilePath || DEFAULT_LEGACY_FILE_PATH
-    ).replace(/^\/+/, '');
-
-    const invalidPath = (value: string) =>
-      !value ||
-      value.split('/').some(
-        (part) => !part || part === '.' || part === '..'
-      );
-
-    if (invalidPath(filePath)) {
-      throw new Error('ACCOUNT_SYNC_PATH 路徑無效');
-    }
-
-    if (invalidPath(legacyFilePath)) {
-      throw new Error('ACCOUNT_SYNC_LEGACY_PATH 路徑無效');
-    }
-
-    if (!options.store.replaceAll) {
-      throw new Error(
-        '帳號儲存層不支援 replaceAll，無法安全還原 GitHub 備份'
-      );
+      throw new Error('ACCOUNT_SYNC_KEY 至少需要 32 個字元');
     }
 
     this.store = options.store;
     this.repo = options.repo.trim();
     this.token = options.token.trim();
-
-    this.key = crypto.scryptSync(
-      options.encryptionKey,
-      KDF_SALT,
-      32
-    );
-
-    // 讀取時相容舊版常見的密鑰衍生方式。
-    // 寫入時仍固定使用目前的 scrypt 密鑰。
-    const candidates: Buffer[] = [this.key];
-
-    const addCandidate = (candidate: Buffer) => {
-      if (candidate.length !== 32) return;
-
-      if (
-        !candidates.some((existing) =>
-          existing.equals(candidate)
-        )
-      ) {
-        candidates.push(candidate);
-      }
-    };
-
-    const previousKeys = [
-      ...new Set(
-        (options.previousEncryptionKeys || [])
-          .map((value) => value.trim())
-          .filter(
-            (value) =>
-              value && value !== options.encryptionKey
-          )
-      )
-    ];
-
-    for (const value of [
-      options.encryptionKey,
-      ...previousKeys
-    ]) {
-      addCandidate(
-        crypto
-          .createHash('sha256')
-          .update(value, 'utf8')
-          .digest()
-      );
-
-      const raw = Buffer.from(value, 'utf8');
-
-      if (raw.length === 32) {
-        addCandidate(raw);
-      }
-
-      addCandidate(
-        crypto.scryptSync(value, KDF_SALT, 32)
-      );
-    }
-
-    this.readKeys = candidates;
-
-    this.branch = options.branch?.trim() || 'main';
-    this.filePath = filePath;
-    this.legacyFilePath = legacyFilePath;
-
+    this.password = options.encryptionKey;
+    this.branch = options.branch || 'main';
     this.intervalMs = Math.max(
-      1000,
-      Math.min(
-        60_000,
-        options.intervalMs || DEFAULT_INTERVAL_MS
-      )
+      5000,
+      Math.min(60000, options.intervalMs || 5000)
     );
-
-    const encodedPath = this.filePath
-      .split('/')
-      .map(encodeURIComponent)
-      .join('/');
-
-    this.apiUrl =
-      `https://api.github.com/repos/${this.repo}/contents/${encodedPath}`;
   }
 
-  /** 必須在 loadAccountSessions 之前呼叫，確保新實例先取得雲端帳號。 */
+  private headers() {
+    return {
+      Authorization: `Bearer ${this.token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'wow-origin-account-backup'
+    };
+  }
+
+  private fileUrl(filePath: string): string {
+    const encoded = filePath.split('/').map(encodeURIComponent).join('/');
+    return `https://api.github.com/repos/${this.repo}/contents/${encoded}`;
+  }
+
+  private async readFile(filePath: string): Promise<RemoteFile | null> {
+    try {
+      const response = await axios.get(this.fileUrl(filePath), {
+        params: { ref: this.branch },
+        headers: this.headers(),
+        timeout: 20000
+      });
+
+      const content = String(response.data?.content || '').replace(/\s/g, '');
+
+      if (!content) {
+        throw new Error(`GitHub 備份檔案為空：${filePath}`);
+      }
+
+      const text = Buffer.from(content, 'base64').toString('utf8');
+      let accounts: RawMusicAccount[];
+      let mode: BackupMode;
+
+      if (filePath === JSON_PATH) {
+        accounts = parsePlaintext(text);
+        mode = 'plaintext';
+      } else {
+        const decoded = decodeEncrypted(text, this.password);
+        accounts = decoded.accounts;
+        mode = decoded.mode;
+      }
+
+      const sha = String(response.data?.sha || '');
+
+      if (!sha) {
+        throw new Error('GitHub 備份缺少 SHA');
+      }
+
+      return { path: filePath, sha, accounts, mode };
+    } catch (error: any) {
+      if (error?.response?.status === 404) return null;
+
+      throw error;
+    }
+  }
+
+  private async readRemote(): Promise<RemoteFile | null> {
+    // 優先使用加密檔案。
+    const encrypted = await this.readFile(ENC_PATH);
+
+    if (encrypted) return encrypted;
+
+    // 沒有加密檔案才讀取明文檔案。
+    return this.readFile(JSON_PATH);
+  }
+
   async restore(): Promise<void> {
     const remote = await this.readRemote();
     const local = validateAccounts(this.store.list());
 
     if (!remote) {
-      this.currentSha = undefined;
-      this.lastDigest = '';
       this.initialized = true;
+      this.lastSnapshot = JSON.stringify(local);
 
-      console.info(
-        '[account-backup] GitHub 尚無備份，將以本機帳號建立第一份加密備份'
-      );
+      console.info('[account-backup] GitHub 尚無帳號備份');
 
       return;
     }
 
-    this.currentSha =
-      remote.path === this.filePath
-        ? remote.sha
-        : undefined;
+    this.mode = remote.mode;
+    this.targetPath = remote.path;
+    this.currentSha = remote.sha;
 
-    const merged =
-      local.length > 0
-        ? mergeAccounts(remote.accounts, local)
-        : remote.accounts;
+    // 遠端帳號優先；保留遠端沒有的本機帳號。
+    const merged = new Map<string, RawMusicAccount>();
 
-    if (
-      digest(serializeAccounts(local)) !==
-      digest(serializeAccounts(merged))
-    ) {
-      this.store.replaceAll!(merged);
+    for (const account of local) {
+      merged.set(String(account.api_access_key), account);
     }
 
-    this.lastDigest =
-      remote.path === this.filePath &&
-      remote.encryptedWithCurrentKey
-        ? digest(serializeAccounts(remote.accounts))
-        : '';
+    for (const account of remote.accounts) {
+      merged.set(String(account.api_access_key), account);
+    }
 
+    const accounts = [...merged.values()];
+
+    if (accounts.length > 0) {
+      this.store.replaceAll!(accounts);
+    }
+
+    this.lastSnapshot = JSON.stringify(accounts);
     this.initialized = true;
 
-    // 舊格式解密成功後，會在這裡重新寫成標準加密格式。
-    if (
-      digest(serializeAccounts(merged)) !==
-      this.lastDigest
-    ) {
+    if (JSON.stringify(accounts) !== JSON.stringify(remote.accounts)) {
       await this.flush();
     }
 
     console.info(
-      `[account-backup] 已從 GitHub 還原 ${merged.length} 個帳號`
+      `[account-backup] 已從 GitHub 還原 ${remote.accounts.length} 個帳號，模式：${this.mode}`
     );
   }
 
@@ -694,54 +405,39 @@ export class GitHubAccountBackup {
     if (this.timer || this.stopped) return;
 
     this.store.setChangeListener?.(() => {
-      void this.flush().catch((error) => {
-        console.error(
-          '[account-backup] 帳號變更同步失敗，將在下次同步重試',
-          this.safeMessage(error)
-        );
+      void this.flush().catch(error => {
+        console.error('[account-backup] 帳號變更同步失敗', this.safeMessage(error));
       });
     });
 
     await this.flush();
 
     this.timer = setInterval(() => {
-      void this.flush().catch((error) => {
-        console.error(
-          '[account-backup] 定時同步失敗',
-          this.safeMessage(error)
-        );
+      void this.flush().catch(error => {
+        console.error('[account-backup] 定時同步失敗', this.safeMessage(error));
       });
     }, this.intervalMs);
 
     this.timer.unref?.();
 
-    console.info(
-      `[account-backup] GitHub 加密備份已啟動，間隔 ${this.intervalMs}ms`
-    );
+    console.info(`[account-backup] GitHub 備份已啟動，模式：${this.mode}`);
   }
 
   async stop(): Promise<void> {
-    if (this.timer) {
-      clearInterval(this.timer);
-    }
+    if (this.timer) clearInterval(this.timer);
 
     this.timer = undefined;
     this.store.setChangeListener?.(undefined);
 
     try {
       await this.flush();
-    } catch (error) {
-      console.error(
-        '[account-backup] 關閉前最後一次同步失敗',
-        this.safeMessage(error)
-      );
     } finally {
       this.stopped = true;
     }
   }
 
   async flush(): Promise<void> {
-    if (!this.initialized) return;
+    if (!this.initialized || this.stopped) return;
 
     if (this.inFlight) {
       await this.inFlight;
@@ -749,15 +445,18 @@ export class GitHubAccountBackup {
     }
 
     const accounts = validateAccounts(this.store.list());
-    const snapshot = serializeAccounts(accounts);
-    const snapshotDigest = digest(snapshot);
 
-    if (snapshotDigest === this.lastDigest) return;
+    // 空資料不得覆蓋 GitHub 上的有效備份。
+    if (accounts.length === 0) {
+      console.warn('[account-backup] 本機帳號為空，取消同步以保護遠端備份');
+      return;
+    }
 
-    this.inFlight = this.writeSnapshot(
-      accounts,
-      snapshotDigest
-    );
+    const snapshot = JSON.stringify(accounts);
+
+    if (snapshot === this.lastSnapshot) return;
+
+    this.inFlight = this.write(accounts);
 
     try {
       await this.inFlight;
@@ -766,208 +465,108 @@ export class GitHubAccountBackup {
     }
   }
 
-  private async readRemote(): Promise<
-    (RemoteBackup & {
-      path: string;
-      encrypted: boolean;
-    }) | null
-  > {
-    const paths =
-      this.filePath === this.legacyFilePath
-        ? [this.filePath]
-        : [this.filePath, this.legacyFilePath];
+  private async write(accounts: RawMusicAccount[]): Promise<void> {
+    const plaintext = JSON.stringify({
+      version: 1,
+      savedAt: new Date().toISOString(),
+      accounts
+    }, null, 2);
 
-    for (const remotePath of paths) {
-      const encodedPath = remotePath
-        .split('/')
-        .map(encodeURIComponent)
-        .join('/');
+    let content: string;
 
-      const url =
-        `https://api.github.com/repos/${this.repo}/contents/${encodedPath}`;
-
-      try {
-        const response = await axios.get(url, {
-          params: { ref: this.branch },
-          headers: this.headers(),
-          timeout: 15_000
-        });
-
-        const content = String(
-          response.data?.content || ''
-        ).replace(/\s/g, '');
-
-        if (!content) {
-          throw new Error(
-            'GitHub 備份檔案為空或超過 Contents API 可讀取限制'
-          );
-        }
-
-        const fileBytes = Buffer.from(content, 'base64');
-
-        const decoded = decodeRemoteFile(
-          fileBytes,
-          this.readKeys
-        );
-
-        const sha = String(response.data?.sha || '');
-
-        if (!sha) {
-          throw new Error(
-            'GitHub 備份缺少檔案 SHA，無法安全更新'
-          );
-        }
-
-        return {
-          ...decoded,
-          sha,
-          path: remotePath
-        };
-      } catch (error) {
-        if (statusOf(error) === 404) {
-          continue;
-        }
-
-        throw new Error(
-          `讀取 GitHub 帳號備份失敗：${this.safeMessage(error)}`,
-          { cause: error }
-        );
-      }
+    if (this.mode === 'plaintext') {
+      content = plaintext;
+    } else if (this.mode === 'encrypted-pbkdf2') {
+      content = encryptPbkdf2(accounts, this.password);
+    } else {
+      content = encryptScrypt(accounts, this.password);
     }
 
-    return null;
-  }
-
-  private async writeSnapshot(
-    accounts: RawMusicAccount[],
-    snapshotDigest: string
-  ): Promise<void> {
-    const payload: BackupPayload = {
-      format: 'wow-origin-account-backup',
-      version: 1,
-      updatedAt: new Date().toISOString(),
-      accounts
-    };
-
-    const encrypted = encryptPayload(
-      payload,
-      this.key
-    );
-
-    const requestBody: Record<string, string> = {
-      message: 'chore: update encrypted wow-origin account backup',
-      content: Buffer.from(
-        encrypted,
-        'utf8'
-      ).toString('base64'),
+    const body: Record<string, string> = {
+      message: 'chore: update wow-origin account backup',
+      content: Buffer.from(content, 'utf8').toString('base64'),
       branch: this.branch
     };
 
     if (this.currentSha) {
-      requestBody.sha = this.currentSha;
+      body.sha = this.currentSha;
     }
+
+    const url = this.fileUrl(this.targetPath);
 
     try {
-      const response = await axios.put(
-        this.apiUrl,
-        requestBody,
-        {
-          headers: this.headers(),
-          timeout: 15_000
-        }
-      );
+      const response = await axios.put(url, body, {
+        headers: this.headers(),
+        timeout: 20000
+      });
 
-      this.currentSha = String(
-        response.data?.content?.sha ||
-        this.currentSha ||
-        ''
-      );
-
-      this.lastDigest = snapshotDigest;
+      this.currentSha = response.data?.content?.sha;
+      this.lastSnapshot = JSON.stringify(accounts);
 
       console.info(
-        `[account-backup] 已將 ${accounts.length} 個帳號加密同步到 GitHub`
+        `[account-backup] 已同步 ${accounts.length} 個帳號，模式：${this.mode}`
       );
-    } catch (error) {
-      if (
-        statusOf(error) !== 409 &&
-        statusOf(error) !== 422
-      ) {
-        throw new Error(
-          `寫入 GitHub 帳號備份失敗：${this.safeMessage(error)}`,
-          { cause: error }
-        );
+    } catch (error: any) {
+      if (![409, 422].includes(error?.response?.status)) {
+        throw error;
       }
 
-      // SHA 衝突時重新讀取目前版本，再以最新 SHA 重試。
-      const latest = await this.readRemote();
+      const latest = await this.readFile(this.targetPath);
 
-      if (
-        latest?.path === this.filePath &&
-        digest(serializeAccounts(latest.accounts)) ===
-          snapshotDigest
-      ) {
+      if (latest) {
+        if (JSON.stringify(latest.accounts) === JSON.stringify(accounts)) {
+          this.currentSha = latest.sha;
+          this.lastSnapshot = JSON.stringify(accounts);
+          return;
+        }
+
         this.currentSha = latest.sha;
-        this.lastDigest = snapshotDigest;
-        return;
+        body.sha = latest.sha;
+      } else {
+        this.currentSha = undefined;
+        delete body.sha;
       }
 
-      // 舊路徑的 SHA 不能用於建立新的標準路徑。
-      this.currentSha =
-        latest?.path === this.filePath
-          ? latest.sha
-          : undefined;
+      const response = await axios.put(url, body, {
+        headers: this.headers(),
+        timeout: 20000
+      });
 
-      const retryBody = {
-        ...requestBody,
-        ...(this.currentSha
-          ? { sha: this.currentSha }
-          : {})
-      };
-
-      const response = await axios.put(
-        this.apiUrl,
-        retryBody,
-        {
-          headers: this.headers(),
-          timeout: 15_000
-        }
-      );
-
-      this.currentSha = String(
-        response.data?.content?.sha ||
-        this.currentSha ||
-        ''
-      );
-
-      this.lastDigest = snapshotDigest;
-
-      console.info(
-        `[account-backup] SHA 衝突後重試成功，已同步 ${accounts.length} 個帳號`
-      );
+      this.currentSha = response.data?.content?.sha;
+      this.lastSnapshot = JSON.stringify(accounts);
     }
-  }
-
-  private headers(): Record<string, string> {
-    return {
-      Authorization: `Bearer ${this.token}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'User-Agent': 'wow-origin-account-backup'
-    };
   }
 
   private safeMessage(error: unknown): string {
     if (axios.isAxiosError(error)) {
-      const status = error.response?.status;
-
-      return status
-        ? `HTTP ${status}`
-        : (error.code || 'network error');
+      return error.response?.status
+        ? `HTTP ${error.response.status}`
+        : error.code || 'network error';
     }
 
-    return error instanceof Error
-      ? error.message.slice(0, 300)
-      : 'unknown error';
+    return error instanceof Error ? error.message : 'unknown error';
   }
+}
+
+export function createGitHubAccountBackup(
+  store: AccountStore
+): GitHubAccountBackup | null {
+  const repo = process.env.GITHUB_DATA_REPO || '';
+  const token = process.env.GITHUB_TOKEN || '';
+  const encryptionKey = process.env.ACCOUNT_SYNC_KEY || '';
+
+  // 沒有設定備份環境變數時，不影響原本專案啟動。
+  if (!repo || !token || !encryptionKey) {
+    console.warn('[account-backup] GitHub 備份環境變數未完整設定，略過雲端同步');
+    return null;
+  }
+
+  return new GitHubAccountBackup({
+    store: store as BackupStore,
+    repo,
+    token,
+    encryptionKey,
+    branch: process.env.ACCOUNT_SYNC_BRANCH || 'main',
+    intervalMs: Number(process.env.ACCOUNT_SYNC_INTERVAL_MS || 5000)
+  });
 }
